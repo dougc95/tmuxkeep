@@ -1,0 +1,18 @@
+# >>> tmuxkeep
+Host tmuxkeep
+    HostName 203.0.113.10
+    Port 22
+    User claude
+    IdentityFile ~/.ssh/id_tmuxkeep_ed25519
+    IdentitiesOnly yes
+    ServerAliveInterval 30
+    ServerAliveCountMax 4
+Host tmuxkeep-admin
+    HostName 203.0.113.10
+    Port 22
+    User root
+    IdentityFile ~/.ssh/id_tmuxkeep_admin_ed25519
+    IdentitiesOnly yes
+    AddKeysToAgent no
+Host *
+# <<< tmuxkeep

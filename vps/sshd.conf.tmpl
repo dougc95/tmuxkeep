@@ -1,0 +1,10 @@
+# tmuxkeep: tmuxkeep-setup replaces the user placeholder and installs this as /etc/ssh/sshd_config.d/tmuxkeep.conf. Do not edit on the VPS.
+# PermitRootLogin prohibit-password      <- uncommented by setup --harden-root
+Match User __USER__
+    AuthorizedKeysFile /etc/tmuxkeep/authorized_keys
+    PasswordAuthentication no
+    DisableForwarding yes
+    PermitUserRC no
+    ClientAliveInterval 30
+    ClientAliveCountMax 4
+Match all

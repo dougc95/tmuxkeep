@@ -1,0 +1,6 @@
+# Force LF for everything that runs on Linux or macOS or in the Docker test image.
+vps/** text eol=lf
+tests/** text eol=lf
+laptop/*.sh text eol=lf
+laptop/completion.bash text eol=lf
+.github/** text eol=lf

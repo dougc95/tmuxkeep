@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Test stub for scp (laptop suites). Logs like the ssh stub. When $TK_STUB_SCP_DEST is a directory,
+# copies the source (the next-to-last argument) into it, so a test can look at what deploy staged
+# after deploy has removed its own copy. Exits with $TK_STUB_SCP_RC (default 0). bash 3.2.
+{ printf 'scp'; if [ "$#" -gt 0 ]; then printf ' [%s]' "$@"; fi; printf '\n'; } >> "${TK_STUB_LOG:-/dev/null}"
+src=''
+last=''
+for a in "$@"; do src=$last; last=$a; done
+if [ -n "${TK_STUB_SCP_DEST:-}" ] && [ -d "$TK_STUB_SCP_DEST" ] && [ -n "$src" ]; then
+  cp -R "$src" "$TK_STUB_SCP_DEST/"
+fi
+exit "${TK_STUB_SCP_RC:-0}"

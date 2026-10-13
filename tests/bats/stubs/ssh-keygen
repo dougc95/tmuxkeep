@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Test stub for ssh-keygen (laptop suites). Logs like the ssh stub. Unless $TK_STUB_KEYGEN_RC is
+# non-zero, writes a fake private key to the -f path and a fake ed25519 line to <path>.pub. bash 3.2.
+{ printf 'ssh-keygen'; if [ "$#" -gt 0 ]; then printf ' [%s]' "$@"; fi; printf '\n'; } >> "${TK_STUB_LOG:-/dev/null}"
+rc=${TK_STUB_KEYGEN_RC:-0}
+if [ "$rc" != 0 ]; then exit "$rc"; fi
+f=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -f ] && [ "$#" -ge 2 ]; then f=$2; shift; fi
+  shift
+done
+if [ -n "$f" ]; then
+  printf 'FAKE PRIVATE KEY\n' > "$f"
+  printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIStubStubStubStubStubStubStub tmuxkeep-laptop\n' > "$f.pub"
+fi
+exit 0

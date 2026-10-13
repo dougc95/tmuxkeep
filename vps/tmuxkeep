@@ -1,0 +1,1030 @@
+#!/bin/bash
+# tmuxkeep: tmux session broker, the forced command for the session key of the configured user.
+# New sessions run LAUNCH_CMD and resume runs RESUME_CMD; the defaults start Claude Code.
+# Spec: docs/superpowers/specs/2026-10-12-tmuxkeep-public-release-design.md (builds on the v1 spec)
+LEASE_SECS=1800
+TOMBSTONE_TTL=86400
+OTP_STEP=30
+OTP_FAIL_MAX=3
+OTP_FAIL_WINDOW=600
+OTP_COOLDOWN=300
+OTP_HARD_MAX=10
+OTP_READ_TIMEOUT=60
+SEND_ENTER_DELAY=0.3
+SEND_MAX_BYTES=8000
+GATED_VERBS="new go send rename unlock rm resume auth"
+# shellcheck disable=SC2034  # rewritten by deploy.ps1 or deploy.sh, read by tmuxkeep-setup
+TMUXKEEP_VERSION=dev
+
+# ---- defaults and patterns ----
+DEFAULT_STATE_DIR=/home/claude/.tmuxkeep
+DEFAULT_AUDIT=/var/log/tmuxkeep/audit.log
+DEFAULT_WORK=/home/claude/work
+TMUX_CONF=/etc/tmuxkeep/tmux.conf
+NAME_RE='^[a-z][a-z0-9_-]{0,31}$'
+TOMB_RE='^zz~([a-z][a-z0-9_-]{0,31})~([0-9]+)$'
+REAP_RE='^zz~[a-z][a-z0-9_-]*~([0-9]+)$'
+KEY_RE='^[a-z][a-z0-9_-]{0,15}$'
+URL_RE='^https://[!-~]+$'
+
+# ---- configuration (spec 4.1, 4.4, 4.5) ----
+# The root-owned /etc/tmuxkeep/tmuxkeep.conf, read with the parser below, never sourced. In
+# local mode TMUXKEEP_CONF selects another file, and with neither file the defaults apply.
+DEFAULT_CONF=/etc/tmuxkeep/tmuxkeep.conf
+CONF_KEYS='USER USER_HOME STATE_DIR WORK_DIR AUDIT_LOG LAUNCH_CMD RESUME_CMD LEASE_SECS TOMBSTONE_TTL OTP_FAIL_MAX OTP_FAIL_WINDOW OTP_COOLDOWN OTP_HARD_MAX OTP_READ_TIMEOUT SEND_MAX_BYTES'
+
+# trim_ws STRING: sets TRIMMED to STRING without leading and trailing spaces and tabs. The C
+# locale keeps [:blank:] to exactly those two; in C.UTF-8 it also matches U+3000 and the like.
+trim_ws() {
+  local LC_ALL=C
+  local s=$1
+  s=${s#"${s%%[![:blank:]]*}"}
+  s=${s%"${s##*[![:blank:]]}"}
+  TRIMMED=$s
+}
+
+# printable_ascii STRING: status 0 when every byte is 0x20-0x7E. The empty string passes.
+printable_ascii() {
+  local rest
+  rest=$(printf '%s' "$1" | LC_ALL=C tr -d ' -~'; printf x)
+  [[ $rest == x ]]
+}
+
+# valid_abs_path STRING: absolute, at most 255 bytes, letters digits . _ - and /, no . or .. part.
+valid_abs_path() {
+  (( ${#1} <= 255 )) && [[ $1 =~ ^(/[A-Za-z0-9._-]+)+$ && /$1/ != */./* && /$1/ != */../* ]]
+}
+
+# check_int KEY VALUE LO HI: 1-7 decimal digits within LO..HI, else CONF_ERR and status 1.
+check_int() {
+  if [[ $2 =~ ^[0-9]{1,7}$ ]] && (( 10#$2 >= $3 && 10#$2 <= $4 )); then return 0; fi
+  CONF_ERR="$1: must be an integer from $3 to $4"
+  return 1
+}
+
+# conf_defaults: the built-in values; equal to what tmuxkeep-setup writes for USER=claude.
+conf_defaults() {
+  CF_USER=claude
+  CF_USER_HOME=/home/claude
+  CF_STATE_DIR=$DEFAULT_STATE_DIR
+  CF_WORK_DIR=$DEFAULT_WORK
+  CF_AUDIT_LOG=$DEFAULT_AUDIT
+  CF_LAUNCH_CMD=claude
+  CF_RESUME_CMD='claude --continue'
+  CF_LEASE_SECS=$LEASE_SECS
+  CF_TOMBSTONE_TTL=$TOMBSTONE_TTL
+  CF_OTP_FAIL_MAX=$OTP_FAIL_MAX
+  CF_OTP_FAIL_WINDOW=$OTP_FAIL_WINDOW
+  CF_OTP_COOLDOWN=$OTP_COOLDOWN
+  CF_OTP_HARD_MAX=$OTP_HARD_MAX
+  CF_OTP_READ_TIMEOUT=$OTP_READ_TIMEOUT
+  CF_SEND_MAX_BYTES=$SEND_MAX_BYTES
+}
+
+# validate_conf: checks the CF_* values in key-list order. Status 1 with CONF_ERR="<reason>"
+# (no file name) on the first failure.
+validate_conf() {
+  local path_msg='must be an absolute path made of letters, digits, dot, underscore, hyphen and slash'
+  if ! [[ $CF_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+    CONF_ERR='USER: must match ^[a-z_][a-z0-9_-]{0,31}$'
+    return 1
+  fi
+  if ! valid_abs_path "$CF_USER_HOME"; then CONF_ERR="USER_HOME: $path_msg"; return 1; fi
+  if ! valid_abs_path "$CF_STATE_DIR"; then CONF_ERR="STATE_DIR: $path_msg"; return 1; fi
+  if ! valid_abs_path "$CF_WORK_DIR"; then CONF_ERR="WORK_DIR: $path_msg"; return 1; fi
+  if ! valid_abs_path "$CF_AUDIT_LOG"; then CONF_ERR="AUDIT_LOG: $path_msg"; return 1; fi
+  if (( ${#CF_LAUNCH_CMD} > 200 )); then CONF_ERR='LAUNCH_CMD: at most 200 characters'; return 1; fi
+  if (( ${#CF_RESUME_CMD} > 200 )); then CONF_ERR='RESUME_CMD: at most 200 characters'; return 1; fi
+  check_int LEASE_SECS "$CF_LEASE_SECS" 60 86400 || return 1
+  check_int TOMBSTONE_TTL "$CF_TOMBSTONE_TTL" 3600 2592000 || return 1
+  check_int OTP_FAIL_MAX "$CF_OTP_FAIL_MAX" 1 20 || return 1
+  check_int OTP_FAIL_WINDOW "$CF_OTP_FAIL_WINDOW" 60 86400 || return 1
+  check_int OTP_COOLDOWN "$CF_OTP_COOLDOWN" 10 86400 || return 1
+  # OTP_FAIL_MAX passed check_int above, so it is 1-7 digits and safe for 10#.
+  check_int OTP_HARD_MAX "$CF_OTP_HARD_MAX" $(( 10#$CF_OTP_FAIL_MAX )) 100 || return 1
+  check_int OTP_READ_TIMEOUT "$CF_OTP_READ_TIMEOUT" 10 600 || return 1
+  check_int SEND_MAX_BYTES "$CF_SEND_MAX_BYTES" 1 65536 || return 1
+  return 0
+}
+
+# parse_conf FILE: reads FILE with the strict rules of spec 4.1 (never sources it). Sets every CF_*
+# and returns 0, or sets CONF_ERR="FILE: reason" and returns 1.
+parse_conf() {
+  local file=$1 line key val k n=0 seen=' ' size stripped
+  conf_defaults
+  CONF_ERR=
+  if [[ ! -f $file || ! -r $file ]]; then CONF_ERR="$file: cannot read"; return 1; fi
+  # The file is read through redirects, never as an argument: a relative path such as -x.conf
+  # would be taken for an option, and grep's exit 2 would count as "no match".
+  if head -c 3 < "$file" | LC_ALL=C grep -q $'^\xef\xbb\xbf'; then
+    CONF_ERR="$file: byte order mark found (save without BOM)"
+    return 1
+  fi
+  if LC_ALL=C grep -q $'\r' < "$file"; then
+    CONF_ERR="$file: carriage return found (use LF line endings)"
+    return 1
+  fi
+  # read -r silently drops NUL bytes, so look for them in the whole file before reading it.
+  size=$(wc -c < "$file")
+  stripped=$(LC_ALL=C tr -d '\0' < "$file" | wc -c)
+  if [[ $size != "$stripped" ]]; then
+    CONF_ERR="$file: NUL byte found"
+    return 1
+  fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$(( n + 1 ))
+    trim_ws "$line"
+    line=$TRIMMED
+    if [[ -z $line || $line == '#'* ]]; then continue; fi
+    if [[ $line != *=* ]]; then CONF_ERR="$file: line $n: expected KEY=value"; return 1; fi
+    trim_ws "${line%%=*}"
+    key=$TRIMMED
+    trim_ws "${line#*=}"
+    val=$TRIMMED
+    # The anchored regex is what stops a key such as "USER USER_HOME" matching the key list.
+    if ! [[ $key =~ ^[A-Z_]+$ && " $CONF_KEYS " == *" $key "* ]]; then
+      if [[ $key =~ ^[A-Za-z0-9_]{1,64}$ ]]; then
+        CONF_ERR="$file: line $n: unknown key $key"
+      else
+        CONF_ERR="$file: line $n: unknown key"
+      fi
+      return 1
+    fi
+    if ! printable_ascii "$val"; then
+      CONF_ERR="$file: line $n: non-printable or non-ASCII character in $key"
+      return 1
+    fi
+    printf -v "CF_$key" '%s' "$val"
+    seen+="$key "
+  done < "$file"
+  for k in $CONF_KEYS; do
+    if [[ $seen != *" $k "* ]]; then CONF_ERR="$file: $k: required"; return 1; fi
+  done
+  if ! validate_conf; then CONF_ERR="$file: $CONF_ERR"; return 1; fi
+  return 0
+}
+
+# apply_conf: copies the validated CF_* values into the runtime globals. Every number was checked
+# as 1-7 decimal digits, so 10# is safe.
+apply_conf() {
+  STATE_DIR=$CF_STATE_DIR
+  AUDIT_FILE=$CF_AUDIT_LOG
+  WORK_DIR=$CF_WORK_DIR
+  LAUNCH_CMD=$CF_LAUNCH_CMD
+  RESUME_CMD=$CF_RESUME_CMD
+  LEASE_SECS=$(( 10#$CF_LEASE_SECS ))
+  TOMBSTONE_TTL=$(( 10#$CF_TOMBSTONE_TTL ))
+  OTP_FAIL_MAX=$(( 10#$CF_OTP_FAIL_MAX ))
+  OTP_FAIL_WINDOW=$(( 10#$CF_OTP_FAIL_WINDOW ))
+  OTP_COOLDOWN=$(( 10#$CF_OTP_COOLDOWN ))
+  OTP_HARD_MAX=$(( 10#$CF_OTP_HARD_MAX ))
+  OTP_READ_TIMEOUT=$(( 10#$CF_OTP_READ_TIMEOUT ))
+  SEND_MAX_BYTES=$(( 10#$CF_SEND_MAX_BYTES ))
+}
+
+# ---- string helpers ----
+byte_len() { printf '%s' "$1" | wc -c; }
+
+has_ctrl() { # status 0 when $1 contains C0 (0x01-0x1F) or DEL
+  local stripped
+  stripped=$(printf '%s' "$1" | LC_ALL=C tr -d '\001-\037\177'; printf x)
+  [[ $(byte_len "${stripped%x}") -ne $(byte_len "$1") ]]
+}
+
+# First 64 bytes of an untrusted string with control characters replaced by '?'.
+safe() { printf '%s' "${1:0:64}" | LC_ALL=C tr '\001-\037\177' '?'; }
+
+valid_count() { [[ ${1:-} =~ ^[0-9]{1,4}$ ]]; }
+
+# redact_url STRING: prints STRING with the userinfo of every scheme://userinfo@ replaced by ***.
+# The userinfo runs to the last @ before the next / or space, so a raw @ inside a password does
+# not leave a tail of it behind.
+redact_url() { printf '%s' "$1" | sed -E 's#([a-z]+://)[^/[:space:]]*@#\1***@#g'; }
+
+# ---- audit, failure and success ----
+audit() { # audit true|false DETAIL
+  (( AUDIT_ENABLED )) || return 0
+  local ts filter='{ts:$ts,key:$key,ip:$ip,verb:$verb,session:$session,ok:$ok,detail:$detail}'
+  if (( AUDIT_HAS_CMD )); then
+    filter='{ts:$ts,key:$key,ip:$ip,verb:$verb,session:$session,ok:$ok,detail:$detail,cmd:$cmd}'
+  fi
+  ts=$(date -u -d "@$NOW" +%Y-%m-%dT%H:%M:%SZ)
+  jq -acn --arg ts "$ts" --arg key "${KEY_ID:0:32}" --arg ip "$CLIENT_IP" \
+         --arg verb "${VERB:0:32}" --arg session "${SESSION:0:64}" \
+         --argjson ok "$1" --arg detail "$2" --arg cmd "${AUDIT_CMD:-}" \
+     "$filter" 2>/dev/null >> "$AUDIT_FILE" || printf 'tmuxkeep: audit write failed\n' >&2
+}
+
+# fail CODE MESSAGE [DETAIL]: exits the current shell, so never call it inside $(...),
+# a pipeline segment or a "cmd | while read" loop.
+fail() {
+  local code=$1 msg=$2 detail=${3:-$2}
+  printf 'tmuxkeep: %s\n' "$msg" >&2
+  audit false "$detail"
+  exit "$code"
+}
+
+succeed() { # succeed DETAIL: verbs print their stdout first
+  audit true "${1:-}"
+  exit 0
+}
+
+# ---- argument decoding ----
+decode_args() { # decode_args WORD...: sets ARGS. "b64" first means every later word is base64.
+  ARGS=()
+  if [[ ${1:-} != b64 ]]; then ARGS=("$@"); return 0; fi
+  shift
+  local tok dec n
+  for tok in "$@"; do
+    [[ $tok =~ ^[A-Za-z0-9+/]+={0,2}$ ]] && (( ${#tok} % 4 == 0 )) || fail 2 "bad encoded argument"
+    # The trailing x protects trailing newlines that $(...) would otherwise strip.
+    { dec=$(printf '%s' "$tok" | base64 -d && printf x); } 2>/dev/null || fail 2 "bad encoded argument"
+    dec=${dec%x}
+    # bash silently drops NUL bytes; compare byte counts to catch them.
+    n=$(printf '%s' "$tok" | base64 -d 2>/dev/null | wc -c)
+    (( n == $(byte_len "$dec") )) || fail 2 "bad encoded argument"
+    ARGS+=("$dec")
+  done
+}
+
+# ---- authorization ----
+# Every verb calls authorize once, after validating its arguments and before touching tmux.
+# gate exits (through fail) on every denial and returns 0 only when the caller may proceed.
+# If it ever returns non-zero instead, authorize fails closed (exit 4).
+authorize() { [[ " $GATED_VERBS " == *" $VERB "* ]] || return 0; gate || fail 4 "not authorized"; }
+
+# lease_valid FILE: status 0 when FILE holds a digits-only epoch E with 0 <= NOW - E < LEASE_SECS.
+# Anything else (missing, empty, signs, spaces, more than 15 digits, a future epoch) is no lease.
+lease_valid() {
+  local e='' age
+  [[ -f $1 ]] || return 1
+  { IFS= read -r e < "$1" || [[ -n $e ]]; } 2>/dev/null || return 1
+  [[ $e =~ ^[0-9]{1,15}$ ]] || return 1
+  age=$(( 10#$NOW - 10#$e ))
+  (( age >= 0 && age < LEASE_SECS ))
+}
+
+# gate: the TOTP gate (spec 7.1). Returns 0 when the caller may proceed and exits through fail
+# otherwise, so a non-zero return never happens. Everything runs under an exclusive lock on fd 9,
+# which is closed before every return so that nothing a verb starts (the tmux server, exec tmux
+# attach) inherits it. Exits close it too. The entered code and the secret are never printed,
+# audited or put on a command line. All file contents are validated as digits before arithmetic.
+# Each prompted attempt is recorded in otp-fails before the prompt is shown and HUP, INT and QUIT
+# are ignored until the outcome is recorded, so a dropped connection cannot make a guess free.
+gate() {
+  local now lease="$STATE_DIR/leases/$KEY_ID@$CLIENT_IP"
+  local fails_file="$STATE_DIR/otp-fails" locked_file="$STATE_DIR/otp-locked"
+  local e='' code='' matched='' lastraw='' fresh='' made_lock=0 count=0 newest=0 last=0 n=0
+  local age secret step s out
+
+  # 1. State directory and the lock that serialises every gated call.
+  mkdir -p "$STATE_DIR/leases" 2>/dev/null || fail 1 "cannot create state directory"
+  { exec 9>>"$STATE_DIR/gate.lock"; } 2>/dev/null || fail 1 "cannot open the gate lock"
+  flock 9 || fail 1 "cannot take the gate lock"
+
+  # main sampled NOW before the lock wait, which can last a whole prompt. Take a fresh reading
+  # unless a local-mode test pinned the clock with TMUXKEEP_NOW.
+  if [[ ${MODE:-} != local ]] || ! [[ ${TMUXKEEP_NOW:-} =~ ^[0-9]+$ ]]; then
+    fresh=$(date +%s 2>/dev/null) || fresh=''
+    if [[ $fresh =~ ^[0-9]+$ ]]; then NOW=$fresh; fi
+  fi
+  now=$(( 10#$NOW ))
+
+  # 2. Hard lockout: root must remove the marker. It overrides a valid lease.
+  if [[ -e $locked_file || -L $locked_file ]]; then
+    fail 3 "OTP locked after repeated failures; root must remove $locked_file" otp-locked
+  fi
+
+  # 3. A valid lease for this key id and client IP skips the prompt, except for auth itself.
+  if [[ $VERB != auth ]] && lease_valid "$lease"; then
+    exec 9>&-
+    return 0
+  fi
+
+  # 4. Cooldown: OTP_FAIL_MAX failures inside OTP_FAIL_WINDOW, the newest younger than OTP_COOLDOWN.
+  # newest is taken over the counted (in-window) entries. Lines that are not digits are ignored.
+  if [[ -e $fails_file && ! -r $fails_file ]]; then fail 1 "cannot read otp-fails"; fi
+  if [[ -f $fails_file ]]; then
+    while IFS= read -r e || [[ -n $e ]]; do
+      [[ $e =~ ^[0-9]{1,15}$ ]] || continue
+      e=$(( 10#$e ))
+      age=$(( now - e ))
+      if (( age < 0 || age >= OTP_FAIL_WINDOW )); then continue; fi
+      count=$(( count + 1 ))
+      if (( e > newest )); then newest=$e; fi
+    done < "$fails_file"
+  fi
+  if (( count >= OTP_FAIL_MAX && now - newest < OTP_COOLDOWN )); then
+    fail 4 "cooldown, retry in $(( OTP_COOLDOWN - (now - newest) ))s" cooldown
+  fi
+
+  # 5. The prompt needs a terminal, and stdin being one is not enough: the prompt and the code
+  # go through /dev/tty, so it must open. Neither case counts as a failed attempt.
+  if [[ ! -t 0 ]]; then
+    fail 4 "TOTP required: run with a terminal or run 'tmuxkeep auth' first" no-tty
+  fi
+  { : > /dev/tty; } 2>/dev/null || fail 4 "TOTP required: run with a terminal or run 'tmuxkeep auth' first" no-tty
+
+  # 6. The secret. A missing or empty secret is a setup problem, not a failed attempt (plan Q8).
+  secret=$(tr -d '[:space:]' 2>/dev/null < "$STATE_DIR/totp.secret") || secret=
+  [[ -n $secret ]] || fail 1 "TOTP not configured; run tmuxkeep-setup"
+
+  # 7. Record the attempt before prompting. From here until the outcome is recorded HUP, INT and
+  # QUIT are ignored (the trap is global, so every path out of this function must either exit
+  # or restore it). The attempt therefore counts even if the prompt is abandoned, times out or
+  # the connection is dropped mid-verification; success truncates otp-fails again. The tenth
+  # recorded failure creates otp-locked at once. A call that created the marker removes it
+  # again on success, so root's manual removal recovers the gate: the next wrong code re-locks
+  # it and the next correct code clears it.
+  trap '' HUP INT QUIT
+  { printf '%s\n' "$now" >> "$fails_file"; } 2>/dev/null || fail 1 "cannot record failure"
+  while IFS= read -r e || [[ -n $e ]]; do n=$(( n + 1 )); done < "$fails_file"
+  if (( n >= OTP_HARD_MAX )) && [[ ! -e $locked_file && ! -L $locked_file ]]; then
+    { : > "$locked_file"; } 2>/dev/null || fail 1 "cannot create otp-locked"
+    made_lock=1
+  fi
+
+  # 8. Prompt on the terminal, never on stdout, and read from the terminal, never from stdin.
+  # A timeout or end of input leaves code empty.
+  printf 'TOTP: ' > /dev/tty
+  IFS= read -r -s -t "$OTP_READ_TIMEOUT" code < /dev/tty || code=
+  printf '\n' > /dev/tty
+
+  # 9. Replay guard input: last is the integer in last-otp. One that is not digits counts as 0;
+  # an all-digit value too long to be a step denies everything.
+  { IFS= read -r lastraw < "$STATE_DIR/last-otp" || [[ -n $lastraw ]]; } 2>/dev/null || lastraw=
+  if [[ $lastraw =~ ^[0-9]{1,15}$ ]]; then
+    last=$(( 10#$lastraw ))
+  elif [[ $lastraw =~ ^[0-9]+$ ]]; then
+    last=999999999999999
+  fi
+
+  # 10. Compare against the codes for the previous, current and next step, skipping any step
+  # that is not later than last, so a code that collides with a spent step cannot mask a valid
+  # later one. The secret goes to oathtool on stdin only, and oathtool does not inherit the lock.
+  if [[ $code =~ ^[0-9]{6}$ ]]; then
+    step=$(( now / OTP_STEP ))
+    for s in $(( step - 1 )) "$step" $(( step + 1 )); do
+      if (( s <= last )); then continue; fi
+      out=$(printf '%s' "$secret" | "$OATHTOOL" --totp -b -N "@$(( s * OTP_STEP ))" - 9>&- 2>/dev/null) || out=
+      if [[ $out == "$code" ]]; then matched=$s; break; fi
+    done
+  fi
+
+  # 11. Outcome. Success records the step and the lease, clears the failures (including the
+  # attempt recorded above) and a lock this call created, then hands control back with the lock
+  # fd closed and the signals restored. Anything else (bad format, timeout, no match, replay)
+  # was already counted by step 7; a marker created there stays. fail exits.
+  if [[ -n $matched ]] && (( matched > last )); then
+    { printf '%s\n' "$matched" > "$STATE_DIR/last-otp"; } 2>/dev/null || fail 1 "cannot record authentication"
+    { printf '%s\n' "$now" > "$lease"; } 2>/dev/null || fail 1 "cannot record authentication"
+    { : > "$fails_file"; } 2>/dev/null || fail 1 "cannot record authentication"
+    if (( made_lock )); then
+      { rm -f "$locked_file"; } 2>/dev/null || fail 1 "cannot record authentication"
+    fi
+    exec 9>&-
+    trap - HUP INT QUIT
+    return 0
+  fi
+  fail 4 "wrong code" otp-fail
+}
+
+# ---- tmux layer and names ----
+# tmx is the only place tmux is invoked. -f is passed only when the config is readable.
+tmx() {
+  local -a conf=()
+  [[ -r $TMUX_CONF ]] && conf=(-f "$TMUX_CONF")
+  env -u SSH_ORIGINAL_COMMAND -u SSH_CLIENT -u SSH_CONNECTION -u SSH_TTY -u LC_ALL LANG=C.UTF-8 \
+    tmux -u "${conf[@]}" -S "$TMUX_SOCK" "$@"
+}
+
+# tmux_on is the only way to target a session. The trailing colon makes "=NAME:" a session
+# target for window- and pane-type commands; without it "-t =bash" can resolve to a window
+# named bash in another session.
+tmux_on() { local name=$1 sub=$2; shift 2; tmx "$sub" -t "=$name:" "$@"; }
+
+list_sessions() { tmx list-sessions -F '#{session_name}' 2>/dev/null || true; }
+
+session_exists() { # exact string match only
+  local s
+  while IFS= read -r s; do
+    [[ $s == "$1" ]] && return 0
+  done < <(list_sessions)
+  return 1
+}
+
+tombstones_of() { # tombstones_of BASE: that base's tombstone names, oldest epoch first
+  local s
+  while IFS= read -r s; do
+    if [[ $s =~ $TOMB_RE && ${BASH_REMATCH[1]} == "$1" ]]; then
+      printf '%s %s\n' "${BASH_REMATCH[2]}" "$s"
+    fi
+  done < <(list_sessions) | LC_ALL=C sort -k1,1n -k2,2 | cut -d' ' -f2-
+}
+
+newest_tombstone() { tombstones_of "$1" | tail -n 1; }
+
+# session_using_dir DIR: prints the name of the first session, tombstones included, whose
+# #{session_path} equals DIR exactly, or nothing. Always returns 0: test the output. tmux
+# rewrites ":" in session names to "_", so the first ":" ends the name and the rest is the path.
+session_using_dir() {
+  local row
+  while IFS= read -r row; do
+    if [[ ${row#*:} == "$1" ]]; then
+      printf '%s\n' "${row%%:*}"
+      return 0
+    fi
+  done < <(tmx list-sessions -F '#{session_name}:#{session_path}' 2>/dev/null)
+  return 0
+}
+
+valid_name() { [[ ${1:-} =~ $NAME_RE ]]; }
+valid_tombstone() { [[ ${1:-} =~ $TOMB_RE ]]; }
+
+require_name() { # require_name STR: sets SESSION, fails 2 unless STR is a valid non-tombstone name
+  SESSION=${1:-}
+  [[ -n $SESSION ]] || fail 2 "missing session name"
+  valid_name "$SESSION" || fail 2 "invalid session name: $(safe "$SESSION")"
+}
+
+require_name_or_tombstone() { # as require_name, but tombstone names are accepted too
+  SESSION=${1:-}
+  [[ -n $SESSION ]] || fail 2 "missing session name"
+  valid_name "$SESSION" || valid_tombstone "$SESSION" || fail 2 "invalid session name: $(safe "$SESSION")"
+}
+
+# session_locked NAME: status 0 when the session is locked. Fails closed: a tmux error ends
+# the verb with exit 1 instead of reading as "not locked". display-message exits 0 with empty
+# fields for a session that does not exist, so the session name is part of the format and a
+# reply that does not start with it means the session is gone (exit 5).
+# Call it in the main shell, never inside $(...) or a pipeline, so fail can exit.
+session_locked() {
+  local v
+  v=$(tmux_on "$1" display-message -p '#{session_name}:#{@tmuxkeep_locked}' 2>&1) || fail 1 "tmux: ${v%%$'\n'*}"
+  [[ $v == "$1:"* ]] || fail 5 "no such session: $(safe "$1")"
+  [[ $v == "$1:1" ]]
+}
+
+# clean_title STRING: prints STRING with every non-printable character removed, which
+# includes C0, DEL and the UTF-8 C1 controls U+0080-U+009F. Needs a UTF-8 LC_ALL (main
+# exports C.UTF-8). Use it on any tmux-supplied text that is shown to a terminal.
+clean_title() { printf '%s' "${1//[^[:print:]]/}"; }
+
+humanise() { # humanise SECONDS: 59s, 59m, 23h, then days; floors; negative counts as 0
+  local s=${1:-0}
+  [[ $s == -* ]] && s=0
+  s=$((10#$s))
+  if (( s < 60 )); then printf '%ds\n' "$s"
+  elif (( s < 3600 )); then printf '%dm\n' $(( s / 60 ))
+  elif (( s < 86400 )); then printf '%dh\n' $(( s / 3600 ))
+  else printf '%dd\n' $(( s / 86400 ))
+  fi
+}
+
+# ---- verbs ----
+verb_log() { # log [-n N]
+  local n=50
+  case $# in
+    0) ;;
+    2) [[ $1 == -n ]] || fail 2 "usage: tmuxkeep log [-n N]"; n=$2 ;;
+    *) fail 2 "usage: tmuxkeep log [-n N]" ;;
+  esac
+  valid_count "$n" || fail 2 "-n must be 0-9999"
+  authorize
+  tail -n "$n" "$AUDIT_FILE" || fail 1 "cannot read audit log"
+  succeed "lines=$n"
+}
+
+verb_ls() { # ls [--names | --tombstones]
+  local mode=table
+  # main turned auditing off for --names and --tombstones. A usage error is still a
+  # failure and must write its audit line, so switch auditing back on before failing.
+  case $# in
+    0) ;;
+    1) case $1 in
+         --names) mode=names ;;
+         --tombstones) mode=tombstones ;;
+         *) AUDIT_ENABLED=1; fail 2 "usage: tmuxkeep ls [--names | --tombstones]" ;;
+       esac ;;
+    *) AUDIT_ENABLED=1; fail 2 "usage: tmuxkeep ls [--names | --tombstones]" ;;
+  esac
+  authorize
+
+  local name row
+  if [[ $mode == names ]]; then
+    while IFS= read -r name; do
+      valid_name "$name" && printf '%s\n' "$name"
+    done < <(list_sessions)
+    exit 0
+  fi
+  if [[ $mode == tombstones ]]; then
+    while IFS= read -r name; do
+      if [[ $name =~ $TOMB_RE ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; fi
+    done < <(list_sessions) | sort -u
+    exit 0
+  fi
+
+  # ":" separates the fields, not tab (tab is IFS whitespace and would collapse an empty
+  # @tmuxkeep_locked field) and not "|" (a legal character in a session name). tmux rewrites
+  # ":" in session names to "_", so no earlier field can contain it. The title is last, so
+  # a ":" inside a title stays in the title.
+  local -a rows=()
+  mapfile -t rows < <(tmx list-sessions -F '#{session_name}:#{session_created}:#{session_activity}:#{session_attached}:#{@tmuxkeep_locked}:#{pane_title}' 2>/dev/null)
+  local width=4 created activity attached locked title state mark shown
+  for row in "${rows[@]}"; do
+    IFS=':' read -r name _ <<< "$row"
+    shown=$(clean_title "$name")
+    if (( ${#shown} > width )); then width=${#shown}; fi
+  done
+  printf '%-*s  %-9s  %-8s  %-5s  %-5s  %s\n' "$width" NAME STATE ATTACHED AGE IDLE TITLE
+  for row in "${rows[@]}"; do
+    IFS=':' read -r name created activity attached locked title <<< "$row"
+    [[ $created =~ ^[0-9]+$ ]] || created=$NOW
+    [[ $activity =~ ^[0-9]+$ ]] || activity=$NOW
+    if [[ $name =~ $TOMB_RE ]]; then state=tombstone
+    elif [[ $locked == 1 ]]; then state=locked
+    else state=live
+    fi
+    mark=
+    if [[ $attached =~ ^[1-9][0-9]*$ ]]; then mark='*'; fi
+    shown=$(clean_title "$name")
+    title=$(clean_title "$title")
+    printf '%-*s  %-9s  %-8s  %-5s  %-5s  %s\n' "$width" "$shown" "$state" "$mark" \
+      "$(humanise $(( 10#$NOW - 10#$created )))" "$(humanise $(( 10#$NOW - 10#$activity )))" "${title:0:40}"
+  done
+  succeed listed
+}
+
+verb_peek() { # peek <name|tombstone> [-n N]
+  local n=40
+  case $# in
+    0|1) ;;
+    3) [[ $2 == -n ]] || fail 2 "usage: tmuxkeep peek <name> [-n N]"; n=$3 ;;
+    *) fail 2 "usage: tmuxkeep peek <name> [-n N]" ;;
+  esac
+  valid_count "$n" || fail 2 "-n must be 0-9999"
+  require_name_or_tombstone "${1:-}"
+  authorize
+  session_exists "$SESSION" || fail 5 "no such session: $SESSION"
+  # With -n 0 there is nothing to print. Skip the capture: GNU tail -n 0 exits without
+  # reading, awk would take SIGPIPE, and pipefail would turn that into a spurious failure.
+  if (( 10#$n == 0 )); then succeed "lines=$n"; fi
+  local pane
+  pane=$(tmux_on "$SESSION" capture-pane -p -J -S - 2>&1) || fail 1 "tmux: ${pane%%$'\n'*}"
+  printf '%s\n' "$pane" \
+    | awk '{ l[NR] = $0 } /[^[:space:]]/ { last = NR } END { for (i = 1; i <= last; i++) print l[i] }' \
+    | tail -n "$n" || fail 1 "cannot read pane"
+  succeed "lines=$n"
+}
+
+verb_lock() { # lock <name>
+  (( $# <= 1 )) || fail 2 "usage: tmuxkeep lock <name>"
+  require_name "${1:-}"
+  authorize
+  session_exists "$SESSION" || fail 5 "no such session: $SESSION"
+  local err
+  err=$(tmux_on "$SESSION" set-option @tmuxkeep_locked 1 2>&1) || fail 1 "tmux: ${err%%$'\n'*}"
+  printf 'locked %s\n' "$SESSION"
+  succeed locked
+}
+
+verb_auth() { # auth: always prompts for a code, then starts a lease for this key id and client IP
+  (( $# == 0 )) || fail 2 "usage: tmuxkeep auth"
+  authorize
+  printf 'authenticated; lease valid for %s\n' "$(humanise "$LEASE_SECS")"
+  succeed authenticated
+}
+
+verb_unlock() { # unlock <name>
+  (( $# == 1 )) || fail 2 "usage: tmuxkeep unlock <name>"
+  require_name "$1"
+  authorize
+  session_exists "$SESSION" || fail 5 "no such session: $SESSION"
+  if session_locked "$SESSION"; then
+    local err
+    err=$(tmux_on "$SESSION" set-option -u @tmuxkeep_locked 2>&1) || fail 1 "tmux: ${err%%$'\n'*}"
+  fi
+  printf 'unlocked %s\n' "$SESSION"
+  succeed unlocked
+}
+
+verb_new() { # new <name> [--repo <https-url>] [--cmd <text>] [--shell]: options may come before or after the name
+  local usage="usage: tmuxkeep new <name> [--repo <https-url>] [--cmd <text>] [--shell]"
+  local name='' url='' have_repo=0 npos=0 cmd=$LAUNCH_CMD have_cmd=0 have_shell=0
+  while (( $# > 0 )); do
+    case $1 in
+      --repo)
+        (( have_repo == 0 && $# >= 2 )) || fail 2 "$usage"
+        url=$2
+        have_repo=1
+        shift 2 ;;
+      --cmd)
+        (( have_cmd == 0 && $# >= 2 )) || fail 2 "$usage"
+        cmd=$2
+        have_cmd=1
+        shift 2 ;;
+      --shell)
+        (( have_shell == 0 )) || fail 2 "$usage"
+        have_shell=1
+        shift ;;
+      *)
+        (( npos == 0 )) || fail 2 "$usage"
+        name=$1
+        npos=1
+        shift ;;
+    esac
+  done
+  require_name "$name"
+  if (( have_repo )) && ! [[ $url =~ $URL_RE ]]; then fail 2 "--repo must be an https:// URL"; fi
+  if (( have_shell && have_cmd )); then fail 2 "--shell and --cmd cannot be combined"; fi
+  if (( have_shell )); then
+    # --shell types no command: the pane gets a bare shell and the audit line an empty cmd.
+    cmd=
+    AUDIT_CMD=
+    AUDIT_HAS_CMD=1
+  elif (( have_cmd )); then
+    valid_cmd "$cmd" || fail 2 "--cmd must be at most 200 printable ASCII characters"
+    [[ $cmd == *[!\ ]* ]] || cmd=  # only spaces counts as blank: type nothing, audit ""
+    AUDIT_CMD=$cmd
+    AUDIT_HAS_CMD=1
+  fi
+  authorize
+  umask 022  # all gate state was already written under 077; nothing after this creates broker state
+
+  local dir=$WORK_DIR/$SESSION other err line detail last=
+  if session_exists "$SESSION"; then fail 3 "$SESSION already exists"; fi
+  other=$(newest_tombstone "$SESSION")
+  if [[ -n $other ]]; then fail 3 "a tombstone of $SESSION exists; use tmuxkeep restore $SESSION"; fi
+  other=$(session_using_dir "$dir")
+  if [[ -n $other ]]; then fail 3 "directory $dir already in use by session $(safe "$other")"; fi
+
+  if (( have_repo )); then
+    if [[ -d $dir ]]; then
+      printf 'note: %s exists; skipping clone\n' "$dir"
+    else
+      mkdir -p "$WORK_DIR" 2>/dev/null || fail 1 "cannot create $WORK_DIR"
+      # git's own output is captured and never shown: it can echo the URL with its credentials.
+      err=$(GIT_TERMINAL_PROMPT=0 git clone -q -- "$url" "$dir" 2>&1 >/dev/null) || {
+        while IFS= read -r line; do
+          if [[ $line == *[![:space:]]* ]]; then last=$line; fi
+        done <<< "$err"
+        fail 1 "git clone failed: $(safe "$(redact_url "$last")")"
+      }
+    fi
+  else
+    mkdir -p "$dir" 2>/dev/null || fail 1 "cannot create $dir"
+  fi
+
+  err=$(tmx new-session -d -s "$SESSION" -c "$dir" 2>&1) || fail 1 "tmux: ${err%%$'\n'*}"
+  type_line "$SESSION" "$cmd"
+  printf 'created %s in %s\n' "$SESSION" "$dir"
+  detail="created dir=$dir"
+  if (( have_repo )); then detail+=" repo=$(redact_url "$url")"; fi
+  succeed "$detail"
+}
+
+verb_send() { # send <name> [text...]: types the text literally, then presses Enter
+  require_name "${1:-}"
+  local IFS=' ' text bytes keys
+  text="${*:2}"
+  IFS=$' \t\n'
+  if [[ -z $text ]]; then fail 2 "nothing to send"; fi
+  if has_ctrl "$text"; then fail 2 "text contains control characters"; fi
+  bytes=$(byte_len "$text")
+  if (( bytes > SEND_MAX_BYTES )); then fail 2 "text longer than $SEND_MAX_BYTES bytes"; fi
+  authorize
+  session_exists "$SESSION" || fail 5 "no such session: $SESSION"
+
+  # tmux ends a command at an argument that ends in ";" and reads "\;" as a literal ";", so a
+  # text that ends in ";" gets a backslash in front of that last character.
+  keys=$text
+  if [[ $text == *';' ]]; then keys="${text%;}\\;"; fi
+  # The text is never put in an error message: fail copies its message to the audit log.
+  tmux_on "$SESSION" send-keys -l -- "$keys" >/dev/null 2>&1 || fail 1 "tmux: send-keys failed"
+  sleep "$SEND_ENTER_DELAY"
+  tmux_on "$SESSION" send-keys Enter >/dev/null 2>&1 || fail 1 "tmux: send-keys failed"
+  printf 'sent %s bytes to %s\n' "$bytes" "$SESSION"
+  succeed "len:$bytes"
+}
+
+verb_go() { # go <name>: attach, detaching any other client
+  (( $# == 1 )) || fail 2 "usage: tmuxkeep go <name>"
+  require_name "$1"
+  authorize
+  session_exists "$SESSION" || fail 5 "no such session: $SESSION"
+  [[ -t 0 && -t 1 ]] || fail 4 "go needs a terminal"
+  audit true attached
+  # The one tmux target written outside tmux_on: exec cannot run a shell function.
+  exec env -u SSH_ORIGINAL_COMMAND -u SSH_CLIENT -u SSH_CONNECTION -u SSH_TTY -u LC_ALL LANG=C.UTF-8 \
+    tmux -u -S "$TMUX_SOCK" attach-session -d -t "=$SESSION:"
+}
+
+verb_rename() { # rename <old> <new>: the work directory stays where it is (Claude Code keys history by path)
+  (( $# == 2 )) || fail 2 "usage: tmuxkeep rename <old> <new>"
+  require_name "$1"
+  local new=$2 other err
+  valid_name "$new" || fail 2 "invalid session name: $(safe "$new")"
+  authorize
+  session_exists "$SESSION" || fail 5 "no such session: $SESSION"
+  if session_exists "$new"; then fail 3 "$new already exists"; fi
+  other=$(newest_tombstone "$new")
+  if [[ -n $other ]]; then fail 3 "a tombstone of $new exists"; fi
+  err=$(tmux_on "$SESSION" rename-session "$new" 2>&1) || fail 1 "tmux: ${err%%$'\n'*}"
+  printf 'renamed %s to %s\n' "$SESSION" "$new"
+  succeed "to $new"
+}
+
+verb_rm() { # rm <name> [--now --confirm <name>]: soft delete by tombstone, or kill with confirmation
+  local usage="usage: tmuxkeep rm <name> [--now --confirm <name>]"
+  local name='' hard=0 have_confirm=0 confirm='' npos=0 target='' err ttl_text
+  while (( $# > 0 )); do
+    case $1 in
+      --now)
+        (( hard == 0 )) || fail 2 "$usage"
+        hard=1
+        shift ;;
+      --confirm)
+        (( have_confirm == 0 && $# >= 2 )) || fail 2 "$usage"
+        confirm=$2
+        have_confirm=1
+        shift 2 ;;
+      --*) fail 2 "$usage" ;;
+      *)
+        (( npos == 0 )) || fail 2 "$usage"
+        name=$1
+        npos=1
+        shift ;;
+    esac
+  done
+  (( npos == 1 )) || fail 2 "$usage"
+  if (( have_confirm && ! hard )); then fail 2 "--confirm needs --now"; fi
+  if (( hard )); then
+    require_name_or_tombstone "$name"
+    [[ $have_confirm == 1 && $confirm == "$SESSION" ]] || fail 2 "--confirm must equal $SESSION"
+  else
+    require_name "$name"
+  fi
+  authorize
+
+  if (( ! hard )); then
+    session_exists "$SESSION" || fail 5 "no such session: $SESSION"
+    if session_locked "$SESSION"; then fail 3 "session $SESSION is locked"; fi
+    target="zz~$SESSION~$NOW"
+    err=$(tmux_on "$SESSION" rename-session "$target" 2>&1) || fail 1 "tmux: ${err%%$'\n'*}"
+    # How long the tombstone lives comes from TOMBSTONE_TTL: whole hours as Nh, anything else in seconds.
+    if (( TOMBSTONE_TTL % 3600 == 0 )); then ttl_text="$(( TOMBSTONE_TTL / 3600 ))h"; else ttl_text="${TOMBSTONE_TTL}s"; fi
+    printf 'tombstoned %s; still running, reaped after %s; restore with: tmuxkeep restore %s\n' "$SESSION" "$ttl_text" "$SESSION"
+    succeed tombstoned
+  fi
+
+  # --now: a live session of that name (a full tombstone name counts), else the newest
+  # tombstone of a valid base name.
+  if session_exists "$SESSION"; then
+    target=$SESSION
+  elif valid_name "$SESSION"; then
+    target=$(newest_tombstone "$SESSION")
+  fi
+  [[ -n $target ]] || fail 5 "no such session: $SESSION"
+  if session_locked "$target"; then fail 3 "session $target is locked"; fi
+  err=$(tmux_on "$target" kill-session 2>&1) || fail 1 "tmux: ${err%%$'\n'*}"
+  printf 'killed %s\n' "$target"
+  succeed "killed $target"
+}
+
+verb_restore() { # restore <name>: rename the newest tombstone of <name> back; no lease needed
+  (( $# == 1 )) || fail 2 "usage: tmuxkeep restore <name>"
+  require_name "$1"
+  authorize
+  local tomb err
+  tomb=$(newest_tombstone "$SESSION")
+  [[ -n $tomb ]] || fail 5 "no tombstone for $SESSION"
+  if session_exists "$SESSION"; then fail 3 "$SESSION already exists"; fi
+  err=$(tmux_on "$tomb" rename-session "$SESSION" 2>&1) || fail 1 "tmux: ${err%%$'\n'*}"
+  printf 'restored %s\n' "$SESSION"
+  succeed "restored from $tomb"
+}
+
+# type_line NAME TEXT: types TEXT literally into NAME's active pane, waits SEND_ENTER_DELAY so the
+# program's paste detection cannot swallow the Enter, then presses Enter. TEXT that is empty or
+# only spaces types nothing at all (plan Q2). A trailing ";" gets the same escape as in send.
+# Call it in the main shell, never inside $(...), so that fail can exit.
+type_line() {
+  local keys=$2 err
+  [[ $keys == *[!\ ]* ]] || return 0
+  if [[ $keys == *';' ]]; then keys="${keys%;}\\;"; fi
+  err=$(tmux_on "$1" send-keys -l -- "$keys" 2>&1) || fail 1 "tmux: ${err%%$'\n'*}"
+  sleep "$SEND_ENTER_DELAY"
+  err=$(tmux_on "$1" send-keys Enter 2>&1) || fail 1 "tmux: ${err%%$'\n'*}"
+}
+
+# valid_cmd TEXT: at most 200 characters, every one printable ASCII (spec 7.1).
+valid_cmd() { (( ${#1} <= 200 )) && printable_ascii "$1"; }
+
+verb_resume() { # resume <name> [--cmd <text>] [--shell]: run RESUME_CMD in an idle shell, or recreate a missing session
+  local usage="usage: tmuxkeep resume <name> [--cmd <text>] [--shell]"
+  local name='' npos=0 cmd=$RESUME_CMD have_cmd=0 have_shell=0
+  while (( $# > 0 )); do
+    case $1 in
+      --cmd)
+        (( have_cmd == 0 && $# >= 2 )) || fail 2 "$usage"
+        cmd=$2
+        have_cmd=1
+        shift 2 ;;
+      --shell)
+        (( have_shell == 0 )) || fail 2 "$usage"
+        have_shell=1
+        shift ;;
+      --*) fail 2 "$usage" ;;
+      *)
+        (( npos == 0 )) || fail 2 "$usage"
+        name=$1
+        npos=1
+        shift ;;
+    esac
+  done
+  (( npos == 1 )) || fail 2 "$usage"
+  require_name "$name"
+  if (( have_shell && have_cmd )); then fail 2 "--shell and --cmd cannot be combined"; fi
+  if (( have_shell )); then
+    # --shell types no command: the pane gets a bare shell and the audit line an empty cmd.
+    cmd=
+    AUDIT_CMD=
+    AUDIT_HAS_CMD=1
+  elif (( have_cmd )); then
+    valid_cmd "$cmd" || fail 2 "--cmd must be at most 200 printable ASCII characters"
+    [[ $cmd == *[!\ ]* ]] || cmd=  # only spaces counts as blank: type nothing, audit ""
+    AUDIT_CMD=$cmd
+    AUDIT_HAS_CMD=1
+  fi
+  authorize
+  umask 022  # all gate state was already written under 077; nothing after this creates broker state
+
+  local dir=$WORK_DIR/$SESSION v pane_cmd other err
+  if session_exists "$SESSION"; then
+    # As in session_locked: display-message exits 0 with empty fields for a session that is
+    # gone, so the session name is part of the format and a reply without it means exit 5.
+    v=$(tmux_on "$SESSION" display-message -p '#{session_name}:#{pane_current_command}' 2>&1) || fail 1 "tmux: ${v%%$'\n'*}"
+    [[ $v == "$SESSION:"* ]] || fail 5 "no such session: $SESSION"
+    pane_cmd=${v#"$SESSION:"}
+    case $pane_cmd in
+      bash|sh|zsh|dash) ;;
+      *) fail 3 "pane busy ($(safe "$pane_cmd"))" ;;
+    esac
+    type_line "$SESSION" "$cmd"
+    printf 'resumed %s\n' "$SESSION"
+    succeed resumed
+  fi
+
+  # No such session: recreate it from its work directory, unless that would collide (plan Q5).
+  [[ -d $dir ]] || fail 5 "nothing to resume for $SESSION"
+  other=$(newest_tombstone "$SESSION")
+  if [[ -n $other ]]; then fail 3 "tombstone of $SESSION exists; use tmuxkeep restore $SESSION"; fi
+  other=$(session_using_dir "$dir")
+  if [[ -n $other ]]; then fail 3 "directory $dir already in use by session $(safe "$other")"; fi
+  err=$(tmx new-session -d -s "$SESSION" -c "$dir" 2>&1) || fail 1 "tmux: ${err%%$'\n'*}"
+  type_line "$SESSION" "$cmd"
+  printf 'recreated %s\n' "$SESSION"
+  succeed recreated
+}
+
+# reap: kill every tombstone strictly older than TOMBSTONE_TTL. Run by the reaper timer through
+# the local key, never remotely (main refuses that). It must never start a tmux server (the
+# timer's oneshot unit would take it down on exit), so it only lists and kills. One failed kill
+# must not stop the others, so there is no fail or succeed inside the loop: each outcome is
+# audited on its own and the verb exits with its own status.
+verb_reap() {
+  (( $# == 0 )) || fail 2 "usage: tmuxkeep reap"
+  authorize
+  local name e failed=0
+  while IFS= read -r name; do
+    [[ $name =~ $REAP_RE ]] || continue
+    e=${BASH_REMATCH[1]}
+    # More than 15 digits is an epoch far in the future (and could wrap in arithmetic): not old.
+    (( ${#e} <= 15 )) || continue
+    (( 10#$NOW - 10#$e > TOMBSTONE_TTL )) || continue
+    SESSION=$name
+    if tmux_on "$name" kill-session </dev/null >/dev/null 2>&1; then
+      printf 'reaped %s\n' "$name"
+      audit true reaped
+    else
+      printf 'tmuxkeep: reap failed: %s\n' "$name" >&2
+      audit false "reap failed"
+      failed=1
+    fi
+  done < <(list_sessions)
+  if (( failed )); then exit 1; fi
+  exit 0
+}
+
+# ---- entry point ----
+main() {
+  set -u -o pipefail
+  umask 077
+  export LC_ALL=C.UTF-8
+
+  # tmuxkeep --check-conf FILE: local only (a forced command always starts with --key), never
+  # audited. tmuxkeep-setup runs it before installing a new /etc/tmuxkeep/tmuxkeep.conf.
+  if [[ ${1:-} == --check-conf ]]; then
+    if (( $# != 2 )); then
+      printf 'tmuxkeep: usage: tmuxkeep --check-conf <file>\n' >&2
+      exit 2
+    fi
+    if parse_conf "$2"; then exit 0; fi
+    printf 'tmuxkeep: config invalid: %s\n' "$CONF_ERR" >&2
+    exit 1
+  fi
+
+  KEY_ID=local
+  if [[ ${1:-} == --key ]]; then
+    KEY_ID=${2:-}
+    shift
+    if (( $# > 0 )); then shift; fi
+  fi
+
+  MODE=local
+  if [[ -n ${SSH_ORIGINAL_COMMAND+x} && $# -eq 0 ]]; then MODE=remote; fi
+
+  # Configuration (spec 4.4, 4.5, plan Q1). Remote: always the root-owned file. Local: TMUXKEEP_CONF,
+  # else the system file when it exists, else the built-in defaults. A bad file ends the call
+  # before anything is audited, because the audit path comes from it.
+  local conf_file=$DEFAULT_CONF
+  if [[ $MODE == local ]]; then
+    if [[ -n ${TMUXKEEP_CONF:-} ]]; then
+      conf_file=$TMUXKEEP_CONF
+    elif [[ ! -e $DEFAULT_CONF && ! -L $DEFAULT_CONF ]]; then
+      conf_file=
+    fi
+  fi
+  if [[ -n $conf_file ]]; then
+    if ! parse_conf "$conf_file"; then
+      printf 'tmuxkeep: config invalid: %s\n' "$CONF_ERR" >&2
+      exit 1
+    fi
+  else
+    conf_defaults
+  fi
+  apply_conf
+  OATHTOOL=oathtool
+  TMUX_SOCK=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/tmuxkeep.sock
+  NOW=
+  if [[ $MODE == local ]]; then
+    if [[ -n ${TMUXKEEP_HOME:-} ]]; then STATE_DIR=$TMUXKEEP_HOME; fi
+    if [[ -n ${TMUXKEEP_AUDIT:-} ]]; then AUDIT_FILE=$TMUXKEEP_AUDIT; fi
+    if [[ -n ${TMUXKEEP_WORK:-} ]]; then WORK_DIR=$TMUXKEEP_WORK; fi
+    if [[ -n ${TMUXKEEP_TMUX_SOCKET:-} ]]; then TMUX_SOCK=$TMUXKEEP_TMUX_SOCKET; fi
+    if [[ -n ${TMUXKEEP_OATHTOOL:-} ]]; then OATHTOOL=$TMUXKEEP_OATHTOOL; fi
+    if [[ ${TMUXKEEP_NOW:-} =~ ^[0-9]+$ ]]; then NOW=$TMUXKEEP_NOW; fi
+  fi
+  if [[ -z $NOW ]]; then NOW=$(date +%s); fi
+
+  CLIENT_IP=-
+  if [[ $MODE == remote ]]; then
+    local ip=${SSH_CLIENT:-}
+    ip=${ip%% *}
+    if [[ $ip =~ ^[0-9A-Fa-f:.]{1,45}$ ]]; then CLIENT_IP=$ip; fi
+  fi
+
+  VERB=
+  SESSION=
+  AUDIT_ENABLED=1
+  AUDIT_CMD=
+  AUDIT_HAS_CMD=0
+  [[ $KEY_ID =~ $KEY_RE ]] || fail 2 "invalid key id"
+
+  local -a words=()
+  if [[ $MODE == remote ]]; then
+    if has_ctrl "$SSH_ORIGINAL_COMMAND"; then fail 2 "control characters in command"; fi
+    set -f
+    read -r -a words <<< "$SSH_ORIGINAL_COMMAND"
+    set +f
+  else
+    words=("$@")
+  fi
+
+  decode_args "${words[@]}"
+
+  VERB=${ARGS[0]:-}
+  if [[ -z $VERB ]]; then
+    fail 2 "usage: tmuxkeep <new|ls|peek|go|send|rename|lock|unlock|rm|restore|resume|log|auth> [args]"
+  fi
+  if [[ $VERB == reap && $MODE == remote ]]; then fail 2 "reap is local only"; fi
+  if ! [[ $VERB =~ ^[a-z]+$ ]] || ! declare -F "verb_$VERB" >/dev/null; then
+    fail 2 "unknown verb: $(safe "$VERB")"
+  fi
+  if [[ $VERB == ls && ( ${ARGS[1]:-} == --names || ${ARGS[1]:-} == --tombstones ) ]]; then
+    AUDIT_ENABLED=0
+  fi
+
+  if (( AUDIT_ENABLED )); then
+    if ! { : >> "$AUDIT_FILE"; } 2>/dev/null; then
+      printf 'tmuxkeep: audit log not writable\n' >&2
+      exit 1
+    fi
+  fi
+
+  "verb_$VERB" "${ARGS[@]:1}"
+  # Backstop: every verb must end in succeed, fail, exec or an explicit exit.
+  fail 1 "internal: verb returned"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

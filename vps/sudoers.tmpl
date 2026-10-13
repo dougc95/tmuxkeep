@@ -1,0 +1,4 @@
+# tmuxkeep: tmuxkeep-setup replaces the user placeholder and installs this as /etc/sudoers.d/tmuxkeep (0440) after visudo -cf.
+__USER__ ALL=(root) NOPASSWD: /usr/bin/apt-get update, /usr/bin/apt-get install *
+__USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl restart *, /usr/bin/systemctl reload *, /usr/bin/systemctl status *
+__USER__ ALL=(root) NOPASSWD: /usr/bin/journalctl *

@@ -1,0 +1,6 @@
+[Unit]
+Description=tmuxkeep: reap tombstoned tmux sessions older than TOMBSTONE_TTL
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tmuxkeep --key reaper reap

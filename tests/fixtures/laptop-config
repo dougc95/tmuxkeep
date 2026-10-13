@@ -1,0 +1,35 @@
+# tmuxkeep laptop configuration, written by the deploy script. Edit it by hand if you like:
+# one KEY=value per line, no quotes. Run the deploy script again after a change.
+
+# VPS address: hostname, IPv4 or IPv6 literal.
+HOST=203.0.113.10
+# SSH port of the VPS.
+PORT=22
+# Account on the VPS that owns the tmux sessions; the installer creates it.
+USER=claude
+# Session key, no passphrase. ~ is your home directory.
+KEY=~/.ssh/id_tmuxkeep_ed25519
+# Admin key for root, with a passphrase. Never add it to ssh-agent.
+ADMIN_KEY=~/.ssh/id_tmuxkeep_admin_ed25519
+# Typed into every new session; empty opens a shell only.
+LAUNCH_CMD=claude
+# Typed by resume; empty opens a shell only.
+RESUME_CMD=claude --continue
+# yes installs Claude Code for USER on the next deploy.
+INSTALL_CLAUDE_CODE=no
+# Seconds one TOTP code keeps the gated verbs open (60-86400).
+LEASE_SECS=1800
+# Seconds a removed session survives as a tombstone (3600-2592000).
+TOMBSTONE_TTL=86400
+# Wrong codes within OTP_FAIL_WINDOW that start a cooldown (1-20).
+OTP_FAIL_MAX=3
+# Seconds over which wrong codes are counted (60-86400).
+OTP_FAIL_WINDOW=600
+# Seconds of cooldown after OTP_FAIL_MAX wrong codes (10-86400).
+OTP_COOLDOWN=300
+# Wrong codes since the last good one that lock the gate until root clears it (OTP_FAIL_MAX-100).
+OTP_HARD_MAX=10
+# Seconds the VPS waits at the TOTP prompt (10-600).
+OTP_READ_TIMEOUT=60
+# Largest text that send accepts, in bytes (1-65536).
+SEND_MAX_BYTES=8000

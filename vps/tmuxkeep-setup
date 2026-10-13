@@ -1,0 +1,973 @@
+#!/usr/bin/env bash
+# tmuxkeep-setup: idempotent root installer for the tmuxkeep session broker (spec section 10).
+#
+#   bash tmuxkeep-setup --pubkey-file <path> [--key-id <id>] [--conf <file>] [--rotate-totp] [--harden-root] [--unlock-otp]
+#
+# Run as root from the staging directory that holds tmuxkeep, tmuxkeep-setup, vps-facts.sh,
+# sshd.conf.tmpl, sudoers.tmpl, tmux.conf, systemd/, laptop.pub and deploy.conf. Exit 0 is
+# success, 1 a preflight or step failure, 2 usage or an invalid --conf file.
+#
+# tests/bats/setup.bats, setup-conf.bats and setup-render.bats source this file and call the
+# functions below; only the exit-2 argument paths of main are ever run by tests.
+# The functions return non-zero after printing a message and never exit. Only die and main
+# exit. set -u and pipefail are set inside main so that sourcing leaves the caller's shell
+# alone. There is no set -e: every step checks its own result.
+
+SSHD=/usr/sbin/sshd
+SSHD_MAIN=/etc/ssh/sshd_config
+SSHD_DROPIN=/etc/ssh/sshd_config.d/tmuxkeep.conf
+BROKER_DEST=/usr/local/bin/tmuxkeep
+TMUXKEEP_ETC=/etc/tmuxkeep
+SUDOERS_DEST=/etc/sudoers.d/tmuxkeep
+TK_USER=claude
+TK_HOME=
+VPS_CONF=/etc/tmuxkeep/tmuxkeep.conf
+DEPLOY_CONF_KEYS='USER LAUNCH_CMD RESUME_CMD INSTALL_CLAUDE_CODE LEASE_SECS TOMBSTONE_TTL OTP_FAIL_MAX OTP_FAIL_WINDOW OTP_COOLDOWN OTP_HARD_MAX OTP_READ_TIMEOUT SEND_MAX_BYTES'
+AUDIT_DIR=/var/log/tmuxkeep
+STAGED_FILES=(tmuxkeep tmuxkeep-setup vps-facts.sh sshd.conf.tmpl sudoers.tmpl tmux.conf systemd/tmuxkeep-reaper.service systemd/tmuxkeep-reaper.timer)
+
+say() { printf '%s\n' "$*"; }
+warn() { printf 'tmuxkeep-setup: %s\n' "$*" >&2; }
+die() { warn "$*"; exit 1; }
+usage() {
+  warn "usage: tmuxkeep-setup --pubkey-file <path> [--key-id <id>] [--conf <file>] [--rotate-totp] [--harden-root] [--unlock-otp]"
+}
+
+# ---- argument and file checks ----
+
+valid_key_id() {
+  local re='^[a-z][a-z0-9_-]{0,15}$'
+  [[ $1 =~ $re ]]
+}
+
+has_cr() { LC_ALL=C grep -q $'\r' -- "$1" 2>/dev/null; }
+
+# read_pubkey FILE: one non-empty line, ssh-ed25519 with no options prefix, no CR.
+# Prints "ssh-ed25519 <base64>"; the comment is dropped. The base64 must start with the
+# encoding of the key type string, so a blob of another key type cannot pass.
+read_pubkey() {
+  local file=$1 count line re
+  if [[ ! -f $file || ! -r $file ]]; then
+    warn "public key file is not a readable file: $file"
+    return 1
+  fi
+  if has_cr "$file"; then
+    warn "public key file contains carriage returns: $file"
+    return 1
+  fi
+  count=$(grep -c '[^[:space:]]' "$file")
+  if [[ $count != 1 ]]; then
+    warn "public key file must hold exactly one non-empty line, found $count: $file"
+    return 1
+  fi
+  line=$(grep -m1 '[^[:space:]]' "$file")
+  re='^ssh-ed25519 (AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]+={0,2})( .*)?$'
+  if ! [[ $line =~ $re ]]; then
+    warn "public key file must be a plain ssh-ed25519 line with no options prefix: $file"
+    return 1
+  fi
+  printf 'ssh-ed25519 %s\n' "${BASH_REMATCH[1]}"
+}
+
+# ---- authorized_keys ----
+
+authorized_keys_line() { # authorized_keys_line KEYID KEYLINE
+  printf 'restrict,pty,command="%s --key %s" %s tmuxkeep-%s\n' "$BROKER_DEST" "$1" "$2" "$1"
+}
+
+# render_authorized_keys EXISTING_FILE KEYID KEYLINE: the existing lines (the file may be
+# missing) minus any that carry this key id's forced command, plus the new line.
+render_authorized_keys() {
+  local existing=$1 keyid=$2 keyline=$3
+  if [[ -f $existing ]]; then
+    grep -vF -- "command=\"$BROKER_DEST --key $keyid\"" "$existing"
+  fi
+  authorized_keys_line "$keyid" "$keyline"
+}
+
+# ---- templates ----
+
+# render_template FILE USER: FILE with every __USER__ replaced by USER (spec 7.2). Safe because
+# USER matched ^[a-z_][a-z0-9_-]{0,31}$, and each rendering is validated by its own tool before
+# it is installed. The x keeps the final newline that $(...) would strip.
+render_template() {
+  local text
+  text=$(cat -- "$1" && printf x) || return 1
+  text=${text%x}
+  printf '%s' "${text//__USER__/"$2"}"
+}
+
+# ---- sshd drop-in ----
+
+# render_dropin SRC HARDEN: SRC rendered for TK_USER; with HARDEN=1 the whole commented
+# PermitRootLogin line then becomes exactly "PermitRootLogin prohibit-password" (plan Q1a).
+render_dropin() {
+  local src=$1 harden=$2
+  if [[ $harden == 1 ]]; then
+    render_template "$src" "$TK_USER" |
+      sed -E 's/^#[[:space:]]*PermitRootLogin[[:space:]]+prohibit-password.*$/PermitRootLogin prohibit-password/'
+  else
+    render_template "$src" "$TK_USER"
+  fi
+}
+
+dropin_is_hardened() { grep -qx 'PermitRootLogin prohibit-password' "$1" 2>/dev/null; }
+
+# want_harden FLAG: hardening is sticky (plan Q1). Prints 1 or 0.
+want_harden() {
+  if [[ $1 == 1 ]] || dropin_is_hardened "$SSHD_DROPIN"; then
+    printf '1\n'
+  else
+    printf '0\n'
+  fi
+}
+
+# sshd_effective USER: sorted effective sshd configuration for USER connecting locally.
+sshd_effective() {
+  local out
+  if ! out=$("$SSHD" -T -C "user=$1,host=localhost,addr=127.0.0.1"); then
+    warn "sshd -T failed for user $1"
+    return 1
+  fi
+  printf '%s\n' "$out" | LC_ALL=C sort
+}
+
+# sshd_diff_ok BEFORE AFTER HARDEN: 0 when the files are identical, or, with HARDEN=1, when
+# every differing line is a permitrootlogin line. Otherwise prints the differing lines.
+sshd_diff_ok() {
+  local before=$1 after=$2 harden=$3 diffs rc=0 bad
+  diffs=$(diff --unchanged-line-format= --old-line-format='< %l'$'\n' --new-line-format='> %l'$'\n' \
+    "$before" "$after") || rc=$?
+  if (( rc == 0 )); then return 0; fi
+  if (( rc != 1 )); then
+    warn "diff failed on the sshd configuration snapshots"
+    return 1
+  fi
+  if [[ $harden == 1 ]]; then
+    bad=$(printf '%s\n' "$diffs" | grep -v '^[<>] permitrootlogin ')
+    if [[ -z $bad ]]; then return 0; fi
+  fi
+  warn "root's effective sshd configuration would change (< before, > after):"
+  printf '%s\n' "$diffs" >&2
+  return 1
+}
+
+# check_user_sshd: the drop-in must do its job for user TK_USER.
+check_user_sshd() {
+  local out
+  out=$(sshd_effective "$TK_USER") || return 1
+  if ! printf '%s\n' "$out" | grep -qxF "authorizedkeysfile $TMUXKEEP_ETC/authorized_keys"; then
+    warn "sshd does not use $TMUXKEEP_ETC/authorized_keys alone for user $TK_USER"
+    return 1
+  fi
+  if ! printf '%s\n' "$out" | grep -qxF 'passwordauthentication no'; then
+    warn "sshd allows password authentication for user $TK_USER"
+    return 1
+  fi
+}
+
+# root_login_value FILE: the permitrootlogin value in a sorted sshd -T snapshot.
+root_login_value() { awk '$1 == "permitrootlogin" { print $2; exit }' "$1"; }
+
+# _dropin_apply SRC HARDEN TMPDIR: steps 3 to 7 of install_sshd_dropin. TMPDIR/before holds
+# root's effective configuration from before the change.
+_dropin_apply() {
+  local src=$1 harden=$2 tmp=$3 dir=${SSHD_DROPIN%/*} value
+  if ! render_dropin "$src" "$harden" > "$tmp/rendered"; then
+    warn "cannot render the drop-in from $src"
+    return 1
+  fi
+  if [[ ! -d $dir ]] && ! install -d -o root -g root -m 0755 "$dir"; then
+    warn "cannot create $dir"
+    return 1
+  fi
+  if ! install -o root -g root -m 0644 "$tmp/rendered" "$SSHD_DROPIN"; then
+    warn "cannot write $SSHD_DROPIN"
+    return 1
+  fi
+  if ! "$SSHD" -t; then
+    warn "sshd -t rejects the configuration with the new drop-in"
+    return 1
+  fi
+  sshd_effective root > "$tmp/after" || return 1
+  sshd_diff_ok "$tmp/before" "$tmp/after" "$harden" || return 1
+  if [[ $harden == 1 ]]; then
+    value=$(root_login_value "$tmp/after")
+    case $value in
+      prohibit-password | without-password) ;;
+      *)
+        warn "permitrootlogin is still ${value:-unset}: an earlier drop-in or the main config overrides it"
+        return 1
+        ;;
+    esac
+  fi
+  check_user_sshd || return 1
+}
+
+# _dropin_rollback TMPDIR HAD: undo a failed install. With HAD=1 the saved copy goes back; if
+# that fails, the new unvalidated file is removed instead, so one never stays on disk. Returns
+# 0 when the previous state is back (HAD=0: the file is gone), 1 when the restore failed but
+# the new file is gone, 2 when the unvalidated file may still be on disk.
+_dropin_rollback() {
+  local tmp=$1 had=$2 rc=0
+  if (( had )); then
+    if cp -p -- "$tmp/backup" "$SSHD_DROPIN"; then
+      warn "restored the previous $SSHD_DROPIN"
+      return 0
+    fi
+    warn "FAILED to restore the previous $SSHD_DROPIN (saved copy: $tmp/backup); removing the new drop-in"
+    rc=1
+  fi
+  if rm -f -- "$SSHD_DROPIN" && [[ ! -e $SSHD_DROPIN && ! -L $SSHD_DROPIN ]]; then
+    warn "removed $SSHD_DROPIN"
+    return "$rc"
+  fi
+  warn "CRITICAL: could not remove the unvalidated $SSHD_DROPIN; delete it by hand and run sshd -t before any reload"
+  return 2
+}
+
+# install_sshd_dropin SRC HARDEN (spec 4.2): never reloads sshd. On any failure the previous
+# drop-in is restored, or the file removed when there was none, and the result is 1. Hardening
+# is refused up front when root login is already stricter than prohibit-password.
+install_sshd_dropin() {
+  local src=$1 harden=$2 tmp had=0 value rc
+  if ! tmp=$(mktemp -d); then
+    warn "cannot create a temporary directory"
+    return 1
+  fi
+  if ! sshd_effective root > "$tmp/before"; then
+    rm -rf "$tmp"
+    return 1
+  fi
+  if [[ $harden == 1 ]]; then
+    value=$(root_login_value "$tmp/before")
+    case $value in
+      no | forced-commands-only)
+        warn "refusing --harden-root: root login is already $value"
+        rm -rf "$tmp"
+        return 1
+        ;;
+    esac
+  fi
+  if [[ -e $SSHD_DROPIN ]]; then
+    if ! cp -p -- "$SSHD_DROPIN" "$tmp/backup"; then
+      warn "cannot back up $SSHD_DROPIN"
+      rm -rf "$tmp"
+      return 1
+    fi
+    had=1
+  fi
+  if _dropin_apply "$src" "$harden" "$tmp"; then
+    rm -rf "$tmp"
+    return 0
+  fi
+  _dropin_rollback "$tmp" "$had"
+  rc=$?
+  # Keep the saved copy when it could not be put back.
+  if (( had == 0 || rc == 0 )); then rm -rf "$tmp"; fi
+  return 1
+}
+
+sshd_has_include() {
+  grep -Eiq '^[[:space:]]*Include[[:space:]].*sshd_config\.d' "${1:-$SSHD_MAIN}"
+}
+
+# allowusers_ok SSHD_T_TEXT: no AllowUsers at all, or one value that admits TK_USER.
+allowusers_ok() {
+  local vals v
+  vals=$(printf '%s\n' "$1" | awk '$1 == "allowusers" { for (i = 2; i <= NF; i++) print $i }')
+  if [[ -z $vals ]]; then return 0; fi
+  while IFS= read -r v; do
+    case $v in
+      "$TK_USER" | '*' | "$TK_USER"@*) return 0 ;;
+    esac
+  done <<< "$vals"
+  warn "sshd AllowUsers does not admit $TK_USER; add $TK_USER to it and re-run"
+  return 1
+}
+
+# ---- logind, tmux, locale, files ----
+
+# parse_kill_user_processes TEXT: TEXT is busctl's "b true" or "b false". Prints yes, no or unknown.
+parse_kill_user_processes() {
+  local kind val extra
+  read -r kind val extra <<< "$1"
+  if [[ $kind == b && -z $extra ]]; then
+    case $val in
+      true) printf 'yes\n'; return 0 ;;
+      false) printf 'no\n'; return 0 ;;
+    esac
+  fi
+  printf 'unknown\n'
+}
+
+# tmux_version_ok "tmux X.Y": the major version must be 3 or more.
+tmux_version_ok() {
+  local re='([0-9]+)\.[0-9]+'
+  [[ $1 =~ $re ]] || return 1
+  (( 10#${BASH_REMATCH[1]} >= 3 ))
+}
+
+# has_c_utf8 TEXT: TEXT is "locale -a" output. The broker exports LC_ALL=C.UTF-8.
+has_c_utf8() { printf '%s\n' "$1" | grep -Eiqx 'C\.(UTF-8|utf8)'; }
+
+# attr_has_append LSATTR_LINE: the flag field (the first word) contains "a".
+attr_has_append() {
+  local flags=${1%% *}
+  [[ $flags == *a* ]]
+}
+
+# ensure_path_snippet FILE: append the PATH block unless it is already there.
+ensure_path_snippet() {
+  local f=$1
+  if grep -q '^# >>> tmuxkeep path' "$f" 2>/dev/null; then return 0; fi
+  if [[ -s $f && -n $(tail -c 1 "$f") ]]; then printf '\n' >> "$f" || return 1; fi
+  # shellcheck disable=SC2016  # the block is written literally; $PATH and $HOME expand at login
+  printf '%s\n' \
+    '# >>> tmuxkeep path' \
+    'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH" ;; esac' \
+    '# <<< tmuxkeep path' >> "$f"
+}
+
+# staged_files_ok DIR: prints each missing required file; 1 if any.
+staged_files_ok() {
+  local dir=$1 f missing=0
+  for f in "${STAGED_FILES[@]}"; do
+    if [[ ! -f $dir/$f ]]; then
+      printf '%s\n' "$f"
+      missing=1
+    fi
+  done
+  (( missing == 0 ))
+}
+
+# no_symlinks_in_home HOME: root writes into these user-owned paths, and install -d, >> and
+# rm -f dir/* all follow symlinks, so refuse to run while any of them is one.
+no_symlinks_in_home() {
+  local home=${1%/} rel p
+  if [[ -z $home ]]; then
+    warn "no_symlinks_in_home needs the home directory"
+    return 1
+  fi
+  for rel in '' /.tmuxkeep /.tmuxkeep/leases /.tmuxkeep/totp.secret /.tmuxkeep/last-otp /.tmuxkeep/otp-fails \
+             /.tmuxkeep/otp-locked /work /.profile /.bashrc /.config /.config/systemd \
+             /.config/systemd/user /.config/systemd/user/tmuxkeep-reaper.service \
+             /.config/systemd/user/tmuxkeep-reaper.timer; do
+    p=$home$rel
+    if [[ -L $p ]]; then
+      warn "refusing to follow symlink: $p"
+      return 1
+    fi
+  done
+}
+
+# ---- TOTP secret and user manager checks ----
+
+# valid_totp_secret STRING: unpadded base32, 16 to 64 characters, and oathtool derives six
+# digits from it. A malformed secret would make every gate attempt a counted failure.
+# The alphabet is spelled out so the check does not depend on the locale's range rules.
+valid_totp_secret() {
+  local re='^[ABCDEFGHIJKLMNOPQRSTUVWXYZ234567]{16,64}$' code
+  [[ $1 =~ $re ]] || return 1
+  code=$(printf '%s' "$1" | oathtool --totp -b -N @0 - 2>/dev/null) || return 1
+  re='^[0-9]{6}$'
+  [[ $code =~ $re ]]
+}
+
+# totp_secret_file_ok FILE: exactly one line, and that line is a valid secret.
+totp_secret_file_ok() {
+  local f=$1 lines secret
+  [[ -f $f && -r $f ]] || return 1
+  lines=$(grep -c '' "$f")
+  [[ $lines == 1 ]] || return 1
+  secret=$(cat "$f")
+  valid_totp_secret "$secret"
+}
+
+# runtime_dir_ok TEXT UID: TEXT is "systemctl --user show-environment" output. The broker's
+# socket is $XDG_RUNTIME_DIR/tmuxkeep.sock and SSH sessions get that value from pam_systemd, so
+# the reaper timer must see exactly /run/user/UID.
+runtime_dir_ok() { printf '%s\n' "$1" | grep -qxF "XDG_RUNTIME_DIR=/run/user/$2"; }
+
+# user_systemctl UID ARGS...: systemctl --user for TK_USER, run as that user against the
+# manager's private socket in /run/user/UID. Unlike the machine form of systemctl (-M USER@),
+# this needs neither the user's D-Bus bus (the dbus-user-session package) nor systemd 248.
+user_systemctl() {
+  local uid=$1
+  shift
+  runuser -u "$TK_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@"
+}
+
+# chattr_probe: a scratch file under /var/log must accept chattr +a and then chattr -a.
+chattr_probe() {
+  local f
+  if ! f=$(mktemp /var/log/tmuxkeep-setup-chattr.XXXXXX); then
+    warn "cannot create a scratch file under /var/log"
+    return 1
+  fi
+  if ! chattr +a "$f" 2>/dev/null; then
+    rm -f -- "$f"
+    warn "chattr +a does not work under /var/log; the audit log cannot be append-only"
+    return 1
+  fi
+  if ! chattr -a "$f" 2>/dev/null; then
+    warn "chattr -a failed on the scratch file $f; remove it by hand with chattr -a and rm"
+    return 1
+  fi
+  rm -f -- "$f"
+}
+
+# ---- deploy.conf (spec 4.3) ----
+
+# trim_ws STRING: sets TRIMMED to STRING without leading and trailing spaces and tabs. The C
+# locale keeps [:blank:] to exactly those two; in C.UTF-8 it also matches U+3000 and the like.
+trim_ws() {
+  local LC_ALL=C
+  local s=$1
+  s=${s#"${s%%[![:blank:]]*}"}
+  s=${s%"${s##*[![:blank:]]}"}
+  TRIMMED=$s
+}
+
+# printable_ascii STRING: status 0 when every byte is 0x20-0x7E. The empty string passes.
+printable_ascii() {
+  local rest
+  rest=$(printf '%s' "$1" | LC_ALL=C tr -d ' -~'; printf x)
+  [[ $rest == x ]]
+}
+
+# valid_abs_path STRING: absolute, at most 255 bytes, letters digits . _ - and /, no . or .. part.
+valid_abs_path() {
+  (( ${#1} <= 255 )) && [[ $1 =~ ^(/[A-Za-z0-9._-]+)+$ && /$1/ != */./* && /$1/ != */../* ]]
+}
+
+# check_int KEY VALUE LO HI: 1-7 decimal digits within LO..HI, else CONF_ERR and status 1.
+check_int() {
+  if [[ $2 =~ ^[0-9]{1,7}$ ]] && (( 10#$2 >= $3 && 10#$2 <= $4 )); then return 0; fi
+  CONF_ERR="$1: must be an integer from $3 to $4"
+  return 1
+}
+
+# conf_defaults: the built-in values, used when no --conf file is given.
+conf_defaults() {
+  CONF_USER=claude
+  CONF_LAUNCH_CMD=claude
+  CONF_RESUME_CMD='claude --continue'
+  CONF_INSTALL_CLAUDE_CODE=no
+  CONF_LEASE_SECS=1800
+  CONF_TOMBSTONE_TTL=86400
+  CONF_OTP_FAIL_MAX=3
+  CONF_OTP_FAIL_WINDOW=600
+  CONF_OTP_COOLDOWN=300
+  CONF_OTP_HARD_MAX=10
+  CONF_OTP_READ_TIMEOUT=60
+  CONF_SEND_MAX_BYTES=8000
+}
+
+# validate_deploy_conf: checks the CONF_* values in key-list order. Status 1 with CONF_ERR="<reason>"
+# (no file name) on the first failure.
+validate_deploy_conf() {
+  local re='^[a-z_][a-z0-9_-]{0,31}$'
+  if ! [[ $CONF_USER =~ $re ]]; then
+    CONF_ERR='USER: must match ^[a-z_][a-z0-9_-]{0,31}$'
+    return 1
+  fi
+  if (( ${#CONF_LAUNCH_CMD} > 200 )); then CONF_ERR='LAUNCH_CMD: at most 200 characters'; return 1; fi
+  if (( ${#CONF_RESUME_CMD} > 200 )); then CONF_ERR='RESUME_CMD: at most 200 characters'; return 1; fi
+  if [[ $CONF_INSTALL_CLAUDE_CODE != yes && $CONF_INSTALL_CLAUDE_CODE != no ]]; then
+    CONF_ERR='INSTALL_CLAUDE_CODE: must be yes or no'
+    return 1
+  fi
+  check_int LEASE_SECS "$CONF_LEASE_SECS" 60 86400 || return 1
+  check_int TOMBSTONE_TTL "$CONF_TOMBSTONE_TTL" 3600 2592000 || return 1
+  check_int OTP_FAIL_MAX "$CONF_OTP_FAIL_MAX" 1 20 || return 1
+  check_int OTP_FAIL_WINDOW "$CONF_OTP_FAIL_WINDOW" 60 86400 || return 1
+  check_int OTP_COOLDOWN "$CONF_OTP_COOLDOWN" 10 86400 || return 1
+  # OTP_FAIL_MAX passed check_int above, so it is 1-7 digits and safe for 10#.
+  check_int OTP_HARD_MAX "$CONF_OTP_HARD_MAX" $(( 10#$CONF_OTP_FAIL_MAX )) 100 || return 1
+  check_int OTP_READ_TIMEOUT "$CONF_OTP_READ_TIMEOUT" 10 600 || return 1
+  check_int SEND_MAX_BYTES "$CONF_SEND_MAX_BYTES" 1 65536 || return 1
+  return 0
+}
+
+# read_deploy_conf FILE: sets every CONF_* from FILE (spec 4.1 rules, the spec 4.3 keys, every key
+# required, plan Q5) and returns 0, or sets CONF_ERR to "<FILE>: <reason>" and returns 1. The file
+# crossed the network, so it is checked again even though deploy validated the laptop config.
+read_deploy_conf() {
+  local file=$1 line key val n=0 seen=' ' k size stripped
+  CONF_ERR=
+  if [[ ! -f $file || ! -r $file ]]; then CONF_ERR="$file: cannot read"; return 1; fi
+  # The file is read through redirects, never as an argument: a relative path such as -x.conf
+  # would be taken for an option, and grep's exit 2 would count as "no match".
+  if head -c 3 < "$file" | LC_ALL=C grep -q $'^\xef\xbb\xbf'; then
+    CONF_ERR="$file: byte order mark found (save without BOM)"; return 1
+  fi
+  if LC_ALL=C grep -q $'\r' < "$file"; then
+    CONF_ERR="$file: carriage return found (use LF line endings)"; return 1
+  fi
+  # read -r silently drops NUL bytes, so look for them in the whole file before reading it.
+  size=$(wc -c < "$file")
+  stripped=$(LC_ALL=C tr -d '\0' < "$file" | wc -c)
+  if [[ $size != "$stripped" ]]; then
+    CONF_ERR="$file: NUL byte found"; return 1
+  fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$(( n + 1 ))
+    trim_ws "$line"; line=$TRIMMED
+    if [[ -z $line || $line == '#'* ]]; then continue; fi
+    if [[ $line != *=* ]]; then CONF_ERR="$file: line $n: expected KEY=value"; return 1; fi
+    trim_ws "${line%%=*}"; key=$TRIMMED
+    trim_ws "${line#*=}"; val=$TRIMMED
+    # The anchored regex is what stops a key such as "USER LAUNCH_CMD" matching the key list.
+    if ! [[ $key =~ ^[A-Z_]+$ && " $DEPLOY_CONF_KEYS " == *" $key "* ]]; then
+      if [[ $key =~ ^[A-Za-z0-9_]{1,64}$ ]]; then CONF_ERR="$file: line $n: unknown key $key"
+      else CONF_ERR="$file: line $n: unknown key"; fi
+      return 1
+    fi
+    if ! printable_ascii "$val"; then
+      CONF_ERR="$file: line $n: non-printable or non-ASCII character in $key"; return 1
+    fi
+    printf -v "CONF_$key" '%s' "$val"
+    seen+="$key "
+  done < "$file"
+  for k in $DEPLOY_CONF_KEYS; do
+    if [[ $seen != *" $k "* ]]; then CONF_ERR="$file: $k: required"; return 1; fi
+  done
+  if ! validate_deploy_conf; then CONF_ERR="$file: $CONF_ERR"; return 1; fi
+}
+
+# ---- account guards ----
+
+# account_ok USER: an existing USER must be a regular account, uid 1000-59999 (Review Focus 1).
+# A system account (root, daemon, nobody) would get the sudoers rules, a disabled password and
+# the forced command; root would also lose its own authorized_keys to the drop-in.
+account_ok() {
+  local uid
+  uid=$(id -u "$1" 2>/dev/null) || return 0
+  if (( uid < 1000 || uid > 59999 )); then
+    warn "refusing USER=$1: uid $uid is a system account; choose a dedicated user name"
+    return 1
+  fi
+}
+
+# user_unchanged FILE USER: the installed tmuxkeep.conf, if any, names the same USER (Review
+# Focus 5). The audit log and the old user's timer stay behind on a change, so it is manual.
+# Fails closed: an existing file that names no USER cannot be shown to match, so it is refused.
+user_unchanged() {
+  local prev
+  [[ -f $1 ]] || return 0
+  prev=$(sed -n 's/^[[:blank:]]*USER[[:blank:]]*=[[:blank:]]*//p' "$1" | tail -n 1)
+  prev=${prev%"${prev##*[![:blank:]]}"}
+  if [[ -z $prev ]]; then
+    warn "$1 exists but names no USER; see README \"Changing the VPS user\""
+    return 1
+  fi
+  if [[ $prev != "$2" ]]; then
+    warn "USER changed from $prev to $2 since the last deploy; see README \"Changing the VPS user\""
+    return 1
+  fi
+}
+
+# audit_owner_ok USER: an existing audit log must belong to USER. It is append-only (chattr +a),
+# so setup can neither chown it nor replace it, and a log owned by another account would leave
+# the broker unable to append to it (Review Focus 5). A missing log passes.
+audit_owner_ok() {
+  local f=$AUDIT_DIR/audit.log owner
+  [[ -e $f ]] || return 0
+  if ! owner=$(stat -c %U -- "$f"); then
+    warn "cannot read the owner of $f"
+    return 1
+  fi
+  if [[ $owner != "$1" ]]; then
+    warn "$f is owned by $owner, not $1; see README \"Changing the VPS user\""
+    return 1
+  fi
+}
+
+# home_of USER: prints USER's home directory from getent; 1 when the account is missing or the
+# home is not a plain absolute path (the broker would reject it in tmuxkeep.conf).
+home_of() {
+  local h
+  h=$(getent passwd "$1" | cut -d: -f6)
+  if [[ -z $h ]] || ! valid_abs_path "$h"; then
+    warn "home directory of $1 is missing or not a plain absolute path: ${h:-none}"
+    return 1
+  fi
+  printf '%s\n' "$h"
+}
+
+# ---- sudoers and the VPS configuration file ----
+
+# install_sudoers SRC: render SRC for TK_USER under a name sudo ignores (it contains a dot),
+# validate exactly that file, then rename it into place, so sudo never reads a partial or
+# unvalidated file (spec 7.2, G26). On failure SUDOERS_DEST is unchanged.
+install_sudoers() {
+  local src=$1 new=${SUDOERS_DEST%/*}/.tmuxkeep.new
+  if ! install -o root -g root -m 0440 /dev/null "$new" || ! render_template "$src" "$TK_USER" > "$new"; then
+    rm -f -- "$new"
+    warn "cannot stage $new"
+    return 1
+  fi
+  if ! visudo -cf "$new" >/dev/null; then
+    rm -f -- "$new"
+    warn "the rendered sudoers file failed visudo -cf; $SUDOERS_DEST was not changed"
+    return 1
+  fi
+  if ! mv -fT -- "$new" "$SUDOERS_DEST"; then
+    rm -f -- "$new"
+    warn "cannot move the staged sudoers file to $SUDOERS_DEST"
+    return 1
+  fi
+}
+
+# render_vps_conf: the /etc/tmuxkeep/tmuxkeep.conf text (spec 4.4). For USER=claude and the
+# defaults it is tests/fixtures/tmuxkeep.conf byte for byte.
+render_vps_conf() {
+  printf '%s\n' \
+    '# Written by tmuxkeep-setup on every deploy; edits here are overwritten.' \
+    '# Change ~/.tmuxkeep/config on the laptop and deploy again instead.' \
+    "USER=$TK_USER" \
+    "USER_HOME=$TK_HOME" \
+    "STATE_DIR=$TK_HOME/.tmuxkeep" \
+    "WORK_DIR=$TK_HOME/work" \
+    "AUDIT_LOG=$AUDIT_DIR/audit.log" \
+    "LAUNCH_CMD=$CONF_LAUNCH_CMD" \
+    "RESUME_CMD=$CONF_RESUME_CMD" \
+    "LEASE_SECS=$CONF_LEASE_SECS" \
+    "TOMBSTONE_TTL=$CONF_TOMBSTONE_TTL" \
+    "OTP_FAIL_MAX=$CONF_OTP_FAIL_MAX" \
+    "OTP_FAIL_WINDOW=$CONF_OTP_FAIL_WINDOW" \
+    "OTP_COOLDOWN=$CONF_OTP_COOLDOWN" \
+    "OTP_HARD_MAX=$CONF_OTP_HARD_MAX" \
+    "OTP_READ_TIMEOUT=$CONF_OTP_READ_TIMEOUT" \
+    "SEND_MAX_BYTES=$CONF_SEND_MAX_BYTES"
+}
+
+# write_vps_conf BROKER: write the rendering next to VPS_CONF, let BROKER --check-conf it, and
+# only then rename it over VPS_CONF (plan Q7), so a file the broker would reject is never
+# installed. On failure VPS_CONF is unchanged and the temp file is gone. main passes the STAGED
+# broker, before the installed one is replaced, so a rejected configuration never leaves a new
+# broker next to an old configuration. The check runs through bash: staged files are not
+# executable (deploy stages them under umask 077).
+write_vps_conf() {
+  local broker=$1 tmp=$TMUXKEEP_ETC/.tmuxkeep.conf.new
+  if ! install -o root -g root -m 0644 /dev/null "$tmp" || ! render_vps_conf > "$tmp"; then
+    rm -f -- "$tmp"
+    warn "cannot write $tmp"
+    return 1
+  fi
+  if ! bash "$broker" --check-conf "$tmp"; then
+    rm -f -- "$tmp"
+    warn "the broker rejected the new configuration; $VPS_CONF was not installed"
+    return 1
+  fi
+  if ! mv -fT -- "$tmp" "$VPS_CONF"; then
+    rm -f -- "$tmp"
+    warn "cannot move $tmp to $VPS_CONF"
+    return 1
+  fi
+}
+
+# ---- Claude Code opt-in (spec 7.2) and the report ----
+
+# step_claude_code: installs Claude Code for TK_USER only when INSTALL_CLAUDE_CODE=yes.
+step_claude_code() {
+  if [[ $CONF_INSTALL_CLAUDE_CODE != yes ]]; then
+    say "Claude Code: not installed (INSTALL_CLAUDE_CODE=no)"
+    return 0
+  fi
+  install_claude_code
+}
+
+# install_claude_code: Claude Code for TK_USER through the official installer, skipped when
+# claude is already on the user's login PATH. Prints a message and returns 1 on any failure.
+install_claude_code() {
+  if runuser -l "$TK_USER" -c 'command -v claude' >/dev/null 2>&1; then return 0; fi
+  if ! runuser -l "$TK_USER" -c 'set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash'; then
+    warn "the Claude Code install failed; re-run after fixing the network"
+    return 1
+  fi
+  if ! runuser -l "$TK_USER" -c 'command -v claude' >/dev/null 2>&1; then
+    warn "Claude Code installed but claude is not on the PATH of $TK_USER"
+    return 1
+  fi
+}
+
+# report_root_claude: names any claude process running as root; silent when there is none.
+report_root_claude() {
+  local pids
+  pids=$(pgrep -u root -x claude | tr '\n' ' ')
+  if [[ -n $pids ]]; then
+    say "WARNING: claude is running as root (PIDs: ${pids% }); stop it and move its work to $TK_HOME/work"
+  fi
+}
+
+# print_next_steps WORK_DIR INSTALL_CLAUDE_CODE: the closing instructions; step 2 depends on
+# whether Claude Code was installed.
+print_next_steps() {
+  local work=$1 install=$2
+  say "First run:"
+  say "  1. Scan the QR code into an authenticator app."
+  if [[ $install == yes ]]; then
+    say "  2. On the laptop: tmuxkeep new scratch, then tmuxkeep go scratch, complete the Claude Code login inside it, detach with Ctrl-b d."
+  else
+    say "  2. On the laptop: tmuxkeep new scratch, then tmuxkeep go scratch to check the session, detach with Ctrl-b d."
+  fi
+  say "  3. Move any existing projects from /root to $work/ and stop any root tmux sessions (README section \"Migrating work from root\")."
+  say "  4. Once tmuxkeep-admin logs in with the admin key, run deploy again with --harden-root (-HardenRoot on Windows)."
+}
+
+# ---- main ----
+
+main() {
+  set -u -o pipefail
+  # A dropped deploy connection must not kill the script halfway through a rollback or a
+  # sudoers swap (HUP on the closed session, PIPE on the streamed output). Children inherit
+  # the ignore. The locale is pinned so character ranges in the checks mean ASCII.
+  trap '' HUP PIPE
+  export LC_ALL=C
+
+  local PUBKEY_FILE='' KEY_ID=laptop CONF_FILE='' ROTATE=0 HARDEN_FLAG=0 UNLOCK=0
+  local STAGE_DIR KEYLINE HARDEN f c missing
+  local kup_raw kup cfg sshd_all uid state ak_tmp
+  local secret_file totp_state secret url audit tmux_out env_text ver timer
+
+  # 1. Arguments, before anything else. An option's value must not look like another option.
+  while (( $# > 0 )); do
+    case $1 in
+      --pubkey-file)
+        if (( $# < 2 )) || [[ $2 == --* ]]; then usage; exit 2; fi
+        PUBKEY_FILE=$2; shift 2 ;;
+      --key-id)
+        if (( $# < 2 )) || [[ $2 == --* ]]; then usage; exit 2; fi
+        KEY_ID=$2; shift 2 ;;
+      --conf)
+        if (( $# < 2 )) || [[ -z $2 || $2 == --* ]]; then usage; exit 2; fi
+        CONF_FILE=$2; shift 2 ;;
+      --rotate-totp) ROTATE=1; shift ;;
+      --harden-root) HARDEN_FLAG=1; shift ;;
+      --unlock-otp) UNLOCK=1; shift ;;
+      *) usage; exit 2 ;;
+    esac
+  done
+  if [[ -z $PUBKEY_FILE ]]; then usage; exit 2; fi
+  if ! valid_key_id "$KEY_ID"; then usage; exit 2; fi
+
+  # 2. The deploy configuration (spec 4.3), checked again here because it crossed the network.
+  conf_defaults
+  if [[ -n $CONF_FILE ]] && ! read_deploy_conf "$CONF_FILE"; then
+    warn "deploy.conf invalid: $CONF_ERR"
+    exit 2
+  fi
+  TK_USER=$CONF_USER
+
+  # 3. Root, and where the staged files are.
+  if (( EUID != 0 )); then die "must run as root"; fi
+  STAGE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) || die "cannot find the staging directory"
+
+  # 3b. The account guards (spec 7.2, Review Focus 1 and 5). They need only TK_USER and the root
+  # check, and they run before the probes below, so a refused USER touches nothing.
+  account_ok "$TK_USER" || exit 1
+  user_unchanged "$VPS_CONF" "$TK_USER" || exit 1
+  audit_owner_ok "$TK_USER" || exit 1
+
+  # 4. Preflight. Nothing is changed until every check passes.
+  for c in apt-get useradd usermod runuser visudo systemctl loginctl timedatectl getent install \
+           base32 awk diff sort pgrep locale; do
+    if ! command -v "$c" >/dev/null 2>&1; then die "required command missing: $c"; fi
+  done
+  if [[ ! -d /run/systemd/system ]]; then die "systemd is not running"; fi
+  if ! loginctl --no-pager list-users >/dev/null 2>&1; then die "loginctl list-users failed"; fi
+
+  kup_raw=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+    org.freedesktop.login1.Manager KillUserProcesses 2>/dev/null)
+  kup=$(parse_kill_user_processes "$kup_raw")
+  if [[ $kup == unknown ]]; then
+    # No answer from logind: take the last uncommented value of the merged configuration.
+    cfg=$(systemd-analyze cat-config systemd/logind.conf 2>/dev/null |
+      sed -n 's/^[[:space:]]*KillUserProcesses[[:space:]]*=[[:space:]]*//p' | tail -n 1)
+    cfg=${cfg%%[[:space:]]*}
+    case ${cfg,,} in
+      yes | true | 1 | on) kup=yes ;;
+      *) kup=no ;;
+    esac
+  fi
+  if [[ $kup == yes ]]; then
+    die "KillUserProcesses=yes would kill the tmux server when a session ends; set it to no in /etc/systemd/logind.conf.d/ and re-run"
+  fi
+
+  if ! sshd_has_include "$SSHD_MAIN"; then die "$SSHD_MAIN has no Include for sshd_config.d"; fi
+  if ! sshd_all=$("$SSHD" -T); then die "sshd -T failed"; fi
+  if ! printf '%s\n' "$sshd_all" | grep -qx 'pubkeyauthentication yes'; then
+    die "sshd does not have PubkeyAuthentication yes"
+  fi
+  allowusers_ok "$sshd_all" || exit 1
+
+  if [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) != yes ]]; then
+    die "the clock is not NTP synchronized (timedatectl NTPSynchronized is not yes); TOTP needs an accurate clock"
+  fi
+
+  if ! command -v chattr >/dev/null 2>&1 || ! command -v lsattr >/dev/null 2>&1; then
+    die "chattr missing: apt-get install e2fsprogs, then re-run"
+  fi
+  chattr_probe || exit 1
+
+  has_c_utf8 "$(locale -a 2>/dev/null)" || die "C.UTF-8 locale missing; install the locales package"
+
+  if ! missing=$(staged_files_ok "$STAGE_DIR"); then
+    die "staged files missing from $STAGE_DIR: $(printf '%s' "$missing" | tr '\n' ' ')"
+  fi
+  for f in "${STAGED_FILES[@]}"; do
+    if has_cr "$STAGE_DIR/$f"; then die "carriage returns in staged file $f"; fi
+  done
+  KEYLINE=$(read_pubkey "$PUBKEY_FILE") || exit 1
+  if getent passwd "$TK_USER" >/dev/null 2>&1; then
+    TK_HOME=$(home_of "$TK_USER") || exit 1
+    no_symlinks_in_home "$TK_HOME" || exit 1
+  fi
+
+  # Step 1. Packages and their smoke tests. The lock timeout rides out unattended-upgrades.
+  say "step 1: packages"
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update || die "apt-get update failed"
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y \
+    tmux oathtool jq qrencode e2fsprogs git curl util-linux || die "apt-get install failed"
+  tmux_version_ok "$(tmux -V)" || die "tmux is older than 3.0"
+  valid_totp_secret JBSWY3DPEHPK3PXP || die "oathtool does not accept - as the key argument"
+
+  # Step 2. The account and its sudoers allowlist.
+  say "step 2: user and sudoers"
+  if ! id -u "$TK_USER" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$TK_USER" || die "useradd failed"
+  fi
+  TK_HOME=$(home_of "$TK_USER") || exit 1
+  no_symlinks_in_home "$TK_HOME" || exit 1
+  usermod -p '*' "$TK_USER" || die "usermod -p failed"
+  if getent group docker >/dev/null 2>&1; then
+    usermod -aG docker "$TK_USER" || die "adding $TK_USER to docker failed"
+  fi
+  install_sudoers "$STAGE_DIR/sudoers.tmpl" || die "sudoers was not installed; $SUDOERS_DEST is unchanged"
+  uid=$(id -u "$TK_USER") || die "cannot read the uid of $TK_USER"
+
+  # Step 3. Broker, configs, authorized_keys and the sshd drop-in.
+  say "step 3: broker, configuration and sshd drop-in"
+  install -d -o root -g root -m 0755 "$TMUXKEEP_ETC" || die "cannot create $TMUXKEEP_ETC"
+  # The new configuration is checked by the staged broker before that broker replaces the installed
+  # one, so a rejected configuration stops here with the old broker and the old configuration intact.
+  write_vps_conf "$STAGE_DIR/tmuxkeep" || die "stopping: $VPS_CONF was not updated"
+  install -o root -g root -m 0755 "$STAGE_DIR/tmuxkeep" "$BROKER_DEST" || die "cannot install $BROKER_DEST"
+  install -o root -g root -m 0644 "$STAGE_DIR/tmux.conf" "$TMUXKEEP_ETC/tmux.conf" || die "cannot install $TMUXKEEP_ETC/tmux.conf"
+  ak_tmp=$(mktemp) || die "cannot create a temporary file"
+  if ! render_authorized_keys "$TMUXKEEP_ETC/authorized_keys" "$KEY_ID" "$KEYLINE" > "$ak_tmp"; then
+    rm -f -- "$ak_tmp"
+    die "cannot render authorized_keys"
+  fi
+  if ! install -o root -g root -m 0644 "$ak_tmp" "$TMUXKEEP_ETC/authorized_keys"; then
+    rm -f -- "$ak_tmp"
+    die "cannot install $TMUXKEEP_ETC/authorized_keys"
+  fi
+  rm -f -- "$ak_tmp"
+  HARDEN=$(want_harden "$HARDEN_FLAG")
+  install_sshd_dropin "$STAGE_DIR/sshd.conf.tmpl" "$HARDEN" || die "the sshd drop-in was rejected; sshd was not reloaded"
+  systemctl reload ssh || die "systemctl reload ssh failed"
+
+  # Step 4. State directories. The recursive chown repairs files that a local run of the
+  # broker as root may have created.
+  say "step 4: state directories"
+  no_symlinks_in_home "$TK_HOME" || exit 1
+  state=$TK_HOME/.tmuxkeep
+  install -d -o "$TK_USER" -g "$TK_USER" -m 0700 "$state" || die "cannot create $state"
+  chown -R -h "$TK_USER:$TK_USER" "$state" || die "cannot chown $state"
+  install -d -o "$TK_USER" -g "$TK_USER" -m 0755 "$TK_HOME/work" || die "cannot create $TK_HOME/work"
+  if (( UNLOCK )); then
+    rm -f -- "$state/otp-locked" || die "cannot remove otp-locked"
+    install -o "$TK_USER" -g "$TK_USER" -m 0600 /dev/null "$state/otp-fails" || die "cannot truncate otp-fails"
+    say "OTP lockout cleared"
+  fi
+
+  # Step 5. The TOTP secret. This is the only place it is ever printed.
+  say "step 5: TOTP secret"
+  secret_file=$state/totp.secret
+  totp_state=kept
+  if [[ ! -e $secret_file || $ROTATE == 1 ]]; then
+    if [[ -e $secret_file ]]; then totp_state=rotated; else totp_state=created; fi
+    secret=$(head -c 20 /dev/urandom | base32 | tr -d '=\n') || die "cannot generate a TOTP secret"
+    valid_totp_secret "$secret" || die "the generated TOTP secret failed validation"
+    install -o "$TK_USER" -g "$TK_USER" -m 0600 /dev/null "$secret_file" || die "cannot create $secret_file"
+    printf '%s\n' "$secret" > "$secret_file" || die "cannot write $secret_file"
+    install -o "$TK_USER" -g "$TK_USER" -m 0600 /dev/null "$state/last-otp" || die "cannot create last-otp"
+    printf '0\n' > "$state/last-otp" || die "cannot write last-otp"
+    rm -f -- "$state"/leases/*
+    url="otpauth://totp/tmuxkeep@vps?secret=$secret&issuer=tmuxkeep"
+    say "TOTP secret $totp_state. It is shown only now; scan it into an authenticator app."
+    say "$url"
+    printf '%s' "$url" | qrencode -t ANSI || die "qrencode failed"
+    secret='' url=''
+  else
+    totp_secret_file_ok "$secret_file" || die "totp.secret is malformed; re-run with --rotate-totp"
+  fi
+
+  # Step 6. The append-only audit log. An existing +a file is never chown'ed or chmod'ed:
+  # that fails with EPERM even for root.
+  say "step 6: audit log"
+  audit=$AUDIT_DIR/audit.log
+  install -d -o root -g root -m 0755 "$AUDIT_DIR" || die "cannot create $AUDIT_DIR"
+  if [[ ! -e $audit ]]; then
+    install -o "$TK_USER" -g "$TK_USER" -m 0640 /dev/null "$audit" || die "cannot create $audit"
+    chattr +a "$audit" || die "chattr +a failed on $audit"
+  elif ! attr_has_append "$(lsattr "$audit")"; then
+    chattr +a "$audit" || die "chattr +a failed on $audit"
+  fi
+
+  # Step 7. Linger, user manager, units and timer, in this order (spec 8).
+  say "step 7: reaper timer"
+  loginctl enable-linger "$TK_USER" || die "loginctl enable-linger failed"
+  systemctl start "user@$uid.service" || die "cannot start user@$uid.service"
+  runuser -u "$TK_USER" -- mkdir -p "$TK_HOME/.config/systemd/user" || die "cannot create the user unit directory"
+  no_symlinks_in_home "$TK_HOME" || exit 1
+  for f in tmuxkeep-reaper.service tmuxkeep-reaper.timer; do
+    install -o "$TK_USER" -g "$TK_USER" -m 0644 "$STAGE_DIR/systemd/$f" \
+      "$TK_HOME/.config/systemd/user/$f" || die "cannot install $f"
+  done
+  user_systemctl "$uid" daemon-reload || die "daemon-reload failed in the user manager"
+  user_systemctl "$uid" enable --now tmuxkeep-reaper.timer || die "cannot enable tmuxkeep-reaper.timer"
+  env_text=$(user_systemctl "$uid" show-environment) || die "cannot read the user manager environment"
+  runtime_dir_ok "$env_text" "$uid" ||
+    die "user manager XDG_RUNTIME_DIR is not /run/user/$uid; the reaper would use a different tmux socket"
+
+  # Step 8. PATH for the user, and Claude Code only when asked (spec 7.2).
+  say "step 8: PATH and Claude Code"
+  for f in .profile .bashrc; do
+    ensure_path_snippet "$TK_HOME/$f" || die "cannot update $TK_HOME/$f"
+    chown -h "$TK_USER:$TK_USER" "$TK_HOME/$f" || die "cannot chown $TK_HOME/$f"
+  done
+  step_claude_code || exit 1
+
+  # Step 9. Report.
+  say "step 9: report"
+  if [[ $CONF_INSTALL_CLAUDE_CODE == yes ]]; then report_root_claude; fi
+  tmux_out=$(tmux ls 2>/dev/null)
+  if [[ -n $tmux_out ]]; then
+    say "tmux sessions owned by root (stop these after migrating):"
+    printf '%s\n' "$tmux_out" | sed 's/^/  /'
+  else
+    say "no tmux sessions owned by root"
+  fi
+  say "TOTP secret: $totp_state"
+  ver=$(grep -m1 '^TMUXKEEP_VERSION=' "$BROKER_DEST")
+  ver=${ver#TMUXKEEP_VERSION=}
+  ver=${ver//[\"\']/}
+  timer=$(user_systemctl "$uid" is-active tmuxkeep-reaper.timer 2>&1)
+  say "summary:"
+  say "  user:            $TK_USER (uid $uid)"
+  say "  broker version:  ${ver:-unknown}"
+  say "  reaper timer:    ${timer:-unknown}"
+  if dropin_is_hardened "$SSHD_DROPIN"; then
+    say "  root hardening:  on"
+  else
+    say "  root hardening:  off"
+  fi
+  say ""
+  print_next_steps "$TK_HOME/work" "$CONF_INSTALL_CLAUDE_CODE"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

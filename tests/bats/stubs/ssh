@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Test stub for ssh (laptop suites). Appends one line per call to $TK_STUB_LOG: "ssh" and then each
+# argument in brackets. When the first argument is -G (deploy asks what the ssh config says for
+# tmuxkeep-admin) it copies the file $TK_STUB_SSH_G to stdout, or prints "addkeystoagent false" when
+# that variable is unset, and exits with $TK_STUB_SSH_G_RC (default 0; $TK_STUB_SSH_RC does not apply
+# to -G). Any other call copies the file $TK_STUB_SSH_OUT to stdout, prints $TK_STUB_SSH_ERR on
+# stderr, and exits with $TK_STUB_SSH_RC (default 0). bash 3.2.
+{ printf 'ssh'; if [ "$#" -gt 0 ]; then printf ' [%s]' "$@"; fi; printf '\n'; } >> "${TK_STUB_LOG:-/dev/null}"
+if [ "${1:-}" = -G ]; then
+  if [ -n "${TK_STUB_SSH_G:-}" ]; then cat "$TK_STUB_SSH_G"; else printf 'addkeystoagent false\n'; fi
+  exit "${TK_STUB_SSH_G_RC:-0}"
+fi
+if [ -n "${TK_STUB_SSH_OUT:-}" ] && [ -f "$TK_STUB_SSH_OUT" ]; then cat "$TK_STUB_SSH_OUT"; fi
+if [ -n "${TK_STUB_SSH_ERR:-}" ]; then printf '%s\n' "$TK_STUB_SSH_ERR" >&2; fi
+exit "${TK_STUB_SSH_RC:-0}"

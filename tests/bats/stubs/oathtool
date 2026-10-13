@@ -1,0 +1,17 @@
+#!/bin/bash
+# Test stub for oathtool, used through TMUXKEEP_OATHTOOL. Deterministic: the code for
+# "-N @E" is (E / 30) mod 1000000, zero-padded to six digits. It logs its argv
+# (never stdin) to $OATH_STUB_LOG so tests can prove the secret is not on argv.
+printf '%s\n' "$*" >> "${OATH_STUB_LOG:-/dev/null}"
+secret=$(cat)
+[ -n "$secret" ] || { echo 'oathtool stub: empty key on stdin' >&2; exit 1; }
+[ "${!#}" = - ] || { echo 'oathtool stub: last argument must be -' >&2; exit 1; }
+epoch=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -N) epoch=${2#@}; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case $epoch in ''|*[!0-9]*) echo 'oathtool stub: need -N @<epoch>' >&2; exit 1 ;; esac
+printf '%06d\n' $(( (epoch / 30) % 1000000 ))
