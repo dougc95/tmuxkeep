@@ -62,7 +62,8 @@ no_temp_left() {
   [ "${lines[17]}" = '# <<< tmuxkeep' ]
   [ "$(printf '%s\n' "$output" | grep -c AddKeysToAgent)" -eq 1 ]
   # An OpenSSH without UseKeychain rejects the whole config for the keyword, in any section.
-  [ "$(printf '%s\n' "$output" | grep -ci 'UseKeychain\|IgnoreUnknown')" -eq 0 ]
+  [ "$(printf 'x UseKeychain\n' | grep -ciE 'UseKeychain|IgnoreUnknown')" -eq 1 ]
+  [ "$(printf '%s\n' "$output" | grep -ciE 'UseKeychain|IgnoreUnknown')" -eq 0 ]
   [ "$(printf '%s\n' "$output" | grep -c '^Host ')" -eq 3 ]
 }
 
