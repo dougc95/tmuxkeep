@@ -160,3 +160,60 @@ EOF
   [ "$(grep -c 'OTP_FAIL_WINDOW )); then continue' "$TMUXKEEP_BIN")" -eq 1 ]
   [ "$(grep -c 'age < LEASE_SECS' "$TMUXKEEP_BIN")" -eq 1 ]
 }
+
+# follow_lines N ARGS...: the first N lines of "status --follow ARGS...", read through head. The
+# producer never ends on its own, so timeout bounds the whole pipeline (the CI hang lesson); exit
+# 124 would mean the broker did not stop when head went away.
+follow_lines() {
+  local n=$1
+  shift
+  timeout 30 bash -c 'n=$1; shift; bash "$@" </dev/null | head -n "$n"' _ "$n" "$TMUXKEEP_BIN" --key t status --follow "$@"
+}
+
+@test "status --follow writes one audit line first, then one valid JSON object per line" {
+  mk_session api
+  run follow_lines 2 --lines 5
+  [ "$status" -eq 0 ]
+  [ "${#lines[@]}" -eq 2 ]
+  local l
+  for l in "${lines[@]}"; do
+    [ "$(jq -c '[.lines, (.sessions | length)]' <<<"$l")" = '[5,1]' ] || { echo "$l"; return 1; }
+  done
+  [ "$(audit_count)" -eq 1 ]
+  [ "$(audit_field verb)" = status ]
+  [ "$(audit_field ok)" = true ]
+  [ "$(audit_field session)" = '' ]
+  [ "$(audit_field detail)" = 'follow lines=5' ]
+}
+
+@test "status --follow ends when the reader goes away: SIGPIPE by default, the failed write when SIGPIPE is ignored" {
+  run timeout 30 bash -c 'bash "$1" --key t status --follow </dev/null | head -n 1 >/dev/null; echo "broker=${PIPESTATUS[0]}"' _ "$TMUXKEEP_BIN"
+  [ "$status" -eq 0 ]
+  [ "$output" = 'broker=141' ]
+  run timeout 30 bash -c 'trap "" PIPE; bash "$1" --key t status --follow </dev/null | head -n 1 >/dev/null; echo "broker=${PIPESTATUS[0]}"' _ "$TMUXKEEP_BIN"
+  [ "$status" -eq 0 ]
+  [ "$output" = 'broker=0' ]
+  [ "$(audit_count)" -eq 2 ]
+}
+
+@test "status --follow reads the clock again for every snapshot" {
+  unset TMUXKEEP_NOW
+  run follow_lines 2
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .now <<<"${lines[0]}")" != "$(jq -r .now <<<"${lines[1]}")" ]
+}
+
+@test "status --follow with an unwritable audit log warns once on stderr and still streams" {
+  export TMUXKEEP_AUDIT=/nonexistent-dir/audit.log
+  run --separate-stderr follow_lines 2
+  [ "$status" -eq 0 ]
+  [ "${#lines[@]}" -eq 2 ]
+  [ "$stderr" = 'tmuxkeep: audit write failed' ]
+}
+
+@test "status --follow given twice is a usage error, audited" {
+  run --separate-stderr tmuxkeep status --follow --follow
+  [ "$status" -eq 2 ]
+  [ "$stderr" = 'tmuxkeep: usage: tmuxkeep status [--follow] [--lines N]' ]
+  [ "$(audit_field ok)" = false ]
+}

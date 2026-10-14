@@ -679,13 +679,19 @@ status_json() {
       '{version:$version,now:$now,user:$user,lease_secs_left:$left,lease_secs:$lease,otp:{locked:$locked,fails:$fails,cooldown_secs_left:$cool},lines:$lines,sessions:.}'
 }
 
-# status [--lines N]: the dashboard's read (spec 4.1, D15, D19). Not gated. It writes no audit line
-# (main turned auditing off); a usage error turns auditing back on first, as in ls. Task 2 adds --follow.
+# status [--follow] [--lines N]: the dashboard's read (spec 4.1, D15, D19). Not gated. One-shot writes
+# no audit line (main turned auditing off); a usage error turns it back on, as in ls. --follow writes
+# one audit line, then one snapshot every 2 seconds, each with a fresh NOW, until stdout is gone: a
+# closed pipe ends it by SIGPIPE, or by the failed write when SIGPIPE is ignored.
 verb_status() {
   local usage="usage: tmuxkeep status [--follow] [--lines N]"
-  local n=12 have_lines=0 json
+  local follow=0 n=12 have_lines=0 json
   while (( $# > 0 )); do
     case $1 in
+      --follow)
+        (( follow == 0 )) || { AUDIT_ENABLED=1; fail 2 "$usage"; }
+        follow=1
+        shift ;;
       --lines)
         (( have_lines == 0 && $# >= 2 )) || { AUDIT_ENABLED=1; fail 2 "$usage"; }
         n=$2
@@ -697,9 +703,20 @@ verb_status() {
   if ! [[ $n =~ ^[0-9]{1,4}$ ]] || (( 10#$n > 40 )); then AUDIT_ENABLED=1; fail 2 "--lines must be 0-40"; fi
   n=$(( 10#$n ))
   authorize
-  json=$(status_json "$n") || fail 1 "cannot build status"
-  printf '%s\n' "$json"
-  exit 0
+  if (( ! follow )); then
+    json=$(status_json "$n") || fail 1 "cannot build status"
+    printf '%s\n' "$json"
+    exit 0
+  fi
+  AUDIT_ENABLED=1
+  audit true "follow lines=$n"
+  AUDIT_ENABLED=0
+  while :; do
+    json=$(status_json "$n") || fail 1 "cannot build status"
+    printf '%s\n' "$json" 2>/dev/null || exit 0
+    sleep 2
+    fresh_now
+  done
 }
 
 verb_lock() { # lock <name>
