@@ -143,7 +143,8 @@ export function createHandler({ token, port, files, getState, runAction, openTer
     // A body that is declared too large is refused before a byte of it is read.
     const declared = req.headers['content-length'];
     if (declared !== undefined && Number(declared) > MAX_BODY_BYTES) return refuseAndClose(req, res);
-    if (/^100-continue$/i.test(req.headers.expect || '')) res.writeContinue();
+    // 100 Continue only to an HTTP/1.1 client that asked for it, matched the way Node dispatches checkContinue.
+    if (req.httpVersion === '1.1' && /(?:^|\W)100-continue(?:$|\W)/i.test(req.headers.expect || '')) res.writeContinue();
     const body = await readJson(req);
     if (body === TOO_BIG) return refuseAndClose(req, res);
     if (body === undefined) return empty(res, 403);

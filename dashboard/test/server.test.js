@@ -213,6 +213,13 @@ function exited(run, ms = 5000) {
   return Promise.race([run.exit, late]).finally(() => clearTimeout(timer));
 }
 
+// kill9(run): cleanup for the signal tests. SIGKILL, not another SIGTERM or SIGINT (the signal under
+// test may be exactly what the server ignores); the wait for the exit is bounded and never throws.
+async function kill9(run) {
+  if (run.child.exitCode === null && run.child.signalCode === null) run.child.kill('SIGKILL');
+  await exited(run, 3000).catch(() => {});
+}
+
 // On Windows child.kill() ends the child outright and runs none of its signal handlers (Node does run a
 // SIGINT handler on a console Ctrl-C, which a test cannot send), so the two signal tests are POSIX only.
 const NO_SIGNALS = process.platform === 'win32' ? 'on Windows child.kill() ends the child without running its signal handlers' : false;
@@ -225,7 +232,7 @@ test('SIGTERM stops the server with exit 0', { skip: NO_SIGNALS }, async () => {
     run.child.kill('SIGTERM');
     assert.deepEqual(await exited(run), { code: 0, signal: null });
   } finally {
-    await stop(run);
+    await kill9(run);
   }
 });
 
@@ -255,10 +262,10 @@ test('Ctrl-C stops the follow connection too: no ssh child outlives the server',
     };
     await waitFor(gone, 3000);
   } finally {
-    if (run.child.exitCode === null && run.child.signalCode === null) run.child.kill();
+    await kill9(run);
     if (pid) {
       try {
-        process.kill(pid);
+        process.kill(pid, 'SIGKILL');
       } catch {
         // already gone
       }

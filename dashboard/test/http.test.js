@@ -213,7 +213,7 @@ test('go, ui, a bare auth, unknown verbs and bad words are 400 with the reason, 
   assert.deepEqual(seen.actions, [['auth', '--end']]);
 });
 
-test('a second action while one runs is 409; the next one after it ends runs', async () => {
+test('a second action while one runs is 409; the next one after it ends runs', { timeout: 10000 }, async () => {
   let release = () => {};
   actionImpl = () => new Promise((resolve) => {
     release = () => resolve({ code: 0, stdout: '', stderr: '', needs_auth: false });
@@ -353,6 +353,18 @@ test('an Expect request goes through the Host and token checks first', async () 
   const page = parseRaw(await raw(`GET /${TOKEN}/ HTTP/1.1\r\nHost: ${host}\r\nExpect: frob\r\nConnection: close\r\n\r\n`));
   assert.equal(page.status, 200);
   assertSecurityHeaders(page);
+});
+
+test('100 Continue goes only to an HTTP/1.1 client; an HTTP/1.0 client that sends Expect gets just the answer', async () => {
+  const body = '{"words":["log"]}';
+  const text = (version, expect) => `POST /${TOKEN}/api/action HTTP/${version}\r\nHost: ${host}\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\nExpect: ${expect}\r\nConnection: close\r\n\r\n${body}`;
+  const old = await raw(text('1.0', '100-continue'));
+  assert.ok(!old.data.includes('100 Continue'), old.data);
+  assert.equal(parseRaw(old).status, 200);
+  // The same pattern Node uses to send a request to checkContinue: a list that contains 100-continue.
+  const list = await raw(text('1.1', 'foo, 100-continue'));
+  assert.match(list.data, /^HTTP\/1\.1 100 Continue\r\n\r\nHTTP\/1\.1 200 OK\r\n/);
+  assert.deepEqual(seen.actions, [['log'], ['log']]);
 });
 
 test('a Host that only starts with a good one, or hides it in front of or inside another name, is 404', async () => {
