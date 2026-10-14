@@ -24,6 +24,12 @@ switch -CaseSensitive ($verb) {
                 if ($s -eq 'live') { "$n  live    1m  1m  x" }
                 if ($s -eq 'tombstone') { "zz~$n~1790000000  tombstone    1m  1m  x" }
                 exit 0 }
+    'status'  { if ($env:TMUXKEEP_FAKE_STATUS_BAD) { '{"sessions":[{"name":"'; exit 0 }
+                $s = Get-Content -LiteralPath $stateFile -ErrorAction SilentlyContinue
+                $n = Get-Content -LiteralPath $nameFile -ErrorAction SilentlyContinue
+                if ($s -eq 'live' -and -not $env:TMUXKEEP_FAKE_STATUS_EMPTY) { '{"version":"x","sessions":[{"name":"' + $n + '","state":"live"}]}' }
+                else { '{"version":"x","sessions":[]}' }
+                exit 0 }
     'peek'    { 'some pane text'; exit 0 }
     'send'    { "sent 5 bytes to $name"; exit 0 }
     'lock'    { Set-Content -LiteralPath $lockFile -Value 1 -Encoding ascii; "locked $name"; exit 0 }
@@ -49,18 +55,23 @@ switch -CaseSensitive ($verb) {
         $env:TMUXKEEP_FAKE_DIR = (New-Item -ItemType Directory -Path (Join-Path $TestDrive ([guid]::NewGuid().ToString('N')))).FullName
         Remove-Item Env:\TMUXKEEP_FAKE_IGNORE_LOCK -ErrorAction SilentlyContinue
         Remove-Item Env:\TMUXKEEP_FAKE_RM_NOW_LOCKED -ErrorAction SilentlyContinue
+        Remove-Item Env:\TMUXKEEP_FAKE_STATUS_EMPTY -ErrorAction SilentlyContinue
+        Remove-Item Env:\TMUXKEEP_FAKE_STATUS_BAD -ErrorAction SilentlyContinue
     }
 
     AfterAll {
         Remove-Item Env:\TMUXKEEP_FAKE_DIR -ErrorAction SilentlyContinue
         Remove-Item Env:\TMUXKEEP_FAKE_IGNORE_LOCK -ErrorAction SilentlyContinue
         Remove-Item Env:\TMUXKEEP_FAKE_RM_NOW_LOCKED -ErrorAction SilentlyContinue
+        Remove-Item Env:\TMUXKEEP_FAKE_STATUS_EMPTY -ErrorAction SilentlyContinue
+        Remove-Item Env:\TMUXKEEP_FAKE_STATUS_BAD -ErrorAction SilentlyContinue
     }
 
     It 'passes against a broker that behaves' {
         $out = & $Smoke -Wrapper $Fake *>&1 | Out-String -Width 4096
         $LASTEXITCODE | Should -Be 0
         $out | Should -Match 'smoke: all steps passed'
+        ([regex]::Matches($out, '(?m)^PASS ')).Count | Should -Be 14
     }
 
     It 'runs auth first and uses a fresh smoke-xxxxxx name (6 chars)' {
@@ -89,8 +100,25 @@ switch -CaseSensitive ($verb) {
         $env:TMUXKEEP_FAKE_RM_NOW_LOCKED = '1'
         $out = & $Smoke -Wrapper $Fake *>&1 | Out-String -Width 4096
         $LASTEXITCODE | Should -Be 1
-        $out | Should -Match 'FAIL 12/13'
+        $out | Should -Match 'FAIL 13/14'
         $out | Should -Match '(?s)tmuxkeep rm smoke-[a-z0-9]{6} --now --confirm smoke-[a-z0-9]{6}.*restore.*unlock'
         [regex]::Matches($out, 'To clean it up').Count | Should -Be 1
+    }
+
+    It 'step 4 fails, with the cleanup hint, when the status JSON does not name the session' {
+        $env:TMUXKEEP_FAKE_STATUS_EMPTY = '1'
+        $out = & $Smoke -Wrapper $Fake *>&1 | Out-String -Width 4096
+        $LASTEXITCODE | Should -Be 1
+        $out | Should -Match 'FAIL 4/14 status \(JSON naming the session\): the status output does not name smoke-[a-z0-9]{6}'
+        [regex]::Matches($out, 'To clean it up').Count | Should -Be 1
+        $calls = @(Get-Content -LiteralPath (Join-Path $env:TMUXKEEP_FAKE_DIR 'calls.log'))
+        $calls[-1] | Should -BeExactly 'status'
+    }
+
+    It 'step 4 fails when the status output is not JSON' {
+        $env:TMUXKEEP_FAKE_STATUS_BAD = '1'
+        $out = & $Smoke -Wrapper $Fake *>&1 | Out-String -Width 4096
+        $LASTEXITCODE | Should -Be 1
+        $out | Should -Match 'FAIL 4/14'
     }
 }

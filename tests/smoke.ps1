@@ -6,7 +6,7 @@
 # tests\pester\smoke.Tests.ps1 drives it with a fake wrapper instead.
 #
 # It creates one throwaway session named smoke-<6 random chars>, walks it through the whole
-# lifecycle (13 steps), and removes it again. Exit 0 when every step passes. Exit 1 at the first
+# lifecycle (14 steps), and removes it again. Exit 0 when every step passes. Exit 1 at the first
 # mismatch: the script stops there and prints how to clean up by hand. The same cleanup hint is
 # printed if the run is interrupted (Ctrl+C) while a session may exist.
 #
@@ -79,33 +79,54 @@ Write-Host "smoke: session name $n"
 Write-Host 'Type the code from your phone at the TOTP prompt.'
 $global:LASTEXITCODE = $null
 & $Wrapper auth
-Confirm-Step -Step '1/13 auth' -Code $LASTEXITCODE -ExpectCode 0
+Confirm-Step -Step '1/14 auth' -Code $LASTEXITCODE -ExpectCode 0
 
-# Steps 2-13 run inside try/finally: if the run is interrupted (Ctrl+C) or a step throws while a
+# Steps 2-14 run inside try/finally: if the run is interrupted (Ctrl+C) or a step throws while a
 # session may exist, the finally block still prints the cleanup hint. A normal FAIL has already
 # printed it (once, via Stop-Smoke); a clean run has SessionMayExist false, so nothing prints.
 try {
     # A session may exist from here on, even if `new` itself fails halfway.
     $script:SessionMayExist = $true
 
-    Invoke-Step -Step "2/13 new $n" -Words @('new', $n) -Pattern "created $e in "
-    Invoke-Step -Step '3/13 ls (live row)' -Words @('ls') -Pattern "(?m)^$e\s+live"
-    Invoke-Step -Step "4/13 peek $n" -Words @('peek', $n)
-    Invoke-Step -Step "5/13 send $n /help" -Words @('send', $n, '/help') -Pattern "sent \d+ bytes to $e"
-    Invoke-Step -Step "6/13 lock $n" -Words @('lock', $n) -Pattern "locked $e"
-    Invoke-Step -Step "7/13 rm $n (locked, must be refused with exit 3)" -Words @('rm', $n) -ExpectCode 3
-    Invoke-Step -Step "8/13 unlock $n" -Words @('unlock', $n)
-    Invoke-Step -Step "9/13 rm $n (tombstone)" -Words @('rm', $n) -Pattern "tombstoned $e;"
-    Invoke-Step -Step '10/13 ls (tombstone row)' -Words @('ls') -Pattern "(?m)^zz~$e~\d+\s+tombstone"
-    Invoke-Step -Step "11/13 restore $n" -Words @('restore', $n) -Pattern "restored $e"
-    Invoke-Step -Step "12/13 rm $n --now --confirm $n" -Words @('rm', $n, '--now', '--confirm', $n) -Pattern "killed $e"
+    Invoke-Step -Step "2/14 new $n" -Words @('new', $n) -Pattern "created $e in "
+    Invoke-Step -Step '3/14 ls (live row)' -Words @('ls') -Pattern "(?m)^$e\s+live"
+
+    # 4. The dashboard's status: one JSON object that names the session. PASS only after that check.
+    $statusStep = '4/14 status (JSON naming the session)'
+    $global:LASTEXITCODE = $null
+    $script:LastOut = & $Wrapper status | Out-String
+    $statusCode = $LASTEXITCODE
+    if ($statusCode -eq 0) {
+        $named = $false
+        try {
+            $obj = $script:LastOut | ConvertFrom-Json -ErrorAction Stop
+            $named = @($obj.sessions | Where-Object { $_.name -ceq $n }).Count -gt 0
+        }
+        catch {
+            $named = $false
+        }
+        if (-not $named) {
+            Stop-Smoke -Step $statusStep -Reason "the status output does not name $n" -Output $script:LastOut
+        }
+    }
+    Confirm-Step -Step $statusStep -Code $statusCode -ExpectCode 0 -Output $script:LastOut
+
+    Invoke-Step -Step "5/14 peek $n" -Words @('peek', $n)
+    Invoke-Step -Step "6/14 send $n /help" -Words @('send', $n, '/help') -Pattern "sent \d+ bytes to $e"
+    Invoke-Step -Step "7/14 lock $n" -Words @('lock', $n) -Pattern "locked $e"
+    Invoke-Step -Step "8/14 rm $n (locked, must be refused with exit 3)" -Words @('rm', $n) -ExpectCode 3
+    Invoke-Step -Step "9/14 unlock $n" -Words @('unlock', $n)
+    Invoke-Step -Step "10/14 rm $n (tombstone)" -Words @('rm', $n) -Pattern "tombstoned $e;"
+    Invoke-Step -Step '11/14 ls (tombstone row)' -Words @('ls') -Pattern "(?m)^zz~$e~\d+\s+tombstone"
+    Invoke-Step -Step "12/14 restore $n" -Words @('restore', $n) -Pattern "restored $e"
+    Invoke-Step -Step "13/14 rm $n --now --confirm $n" -Words @('rm', $n, '--now', '--confirm', $n) -Pattern "killed $e"
 
     # The session is gone now; a later failure has nothing to clean up.
     $script:SessionMayExist = $false
 
-    # 13. The audit log must show every verb we used, against this session. This step does its own
+    # 14. The audit log must show every verb we used, against this session. This step does its own
     # check (instead of Invoke-Step) so that PASS is printed only after the audit lines are verified.
-    $logStep = '13/13 log -n 20 (audit lines for this session)'
+    $logStep = '14/14 log -n 20 (audit lines for this session)'
     $logWords = @('log', '-n', '20')
     $global:LASTEXITCODE = $null
     $script:LastOut = & $Wrapper @logWords | Out-String
