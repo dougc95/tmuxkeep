@@ -237,8 +237,16 @@ terminal is the wrapper: `<home>\scripts\tmuxkeep.ps1 go api` via
    words as further argv elements (no shell, no quoting). Example
    `TERMINAL_CMD=alacritty -e`.
 2. Windows: `wt.exe -w 0 new-tab --title "tmuxkeep go api" powershell.exe ...` when
-   `wt.exe` resolves on PATH; otherwise `powershell.exe ...` spawned detached, which gets
-   its own console window.
+   `wt.exe` resolves on PATH. Otherwise, and when `wt.exe` fails to start, the console
+   fallback `cmd.exe /c start "tmuxkeep go api" powershell.exe ... -File "<script>" go api`
+   (spawned with verbatim arguments; `start` gives PowerShell its own console window).
+   A home path containing `"` or `%` is refused there with a message pointing at
+   `TERMINAL_CMD`. (Ruling 2026-10-14: a detached `powershell.exe` with ignored stdio
+   gets no usable console.)
+
+`openTerminal` re-checks its own input (verb `go` with a valid name, or `auth` with
+none) and `openBrowser` refuses any address other than
+`http://127.0.0.1:<port>/<32 hex>/`, before anything is spawned.
 3. macOS: `osascript -e 'tell application "Terminal" to do script "<cmd>"'` where
    `<cmd>` is the wrapper path and words, each single-quoted for sh (names are already
    validated, the path is quoted).
