@@ -96,6 +96,12 @@ main {
 }
 
 table { width: 100%; border-collapse: collapse; }
+#sessions, #tombstones table { table-layout: fixed; }
+#sessions th:nth-child(1), #tomb-rows td:nth-child(1) { width: 26%; }
+#sessions th:nth-child(2), #tomb-rows td:nth-child(2) { width: 12%; }
+#sessions th:nth-child(3), #tomb-rows td:nth-child(3) { width: 13%; }
+#sessions th:nth-child(4), #tomb-rows td:nth-child(4) { width: 9%; }
+#sessions th:nth-child(5), #tomb-rows td:nth-child(5) { width: 9%; }
 th, td {
   padding: 4px 6px;
   border-bottom: 1px solid var(--line);

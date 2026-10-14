@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {
-  clock, connectionView, errorText, HINT_255, humanise, lastLine, leaseLabel, logEntries, PENDING_MS, pendingStep, splitSessions, STALL_MS,
-  words,
+  actionOutcome, BANNER_AFTER_MS, bannerDue, clock, connectionView, createActions, errorText, HINT_255, humanise, lastLine, leaseLabel,
+  logEntries, PENDING_MS, pendingStep, planRows, POLL_TIMEOUT_MS, rowCells, splitSessions, STALL_MS, words,
 } from '../public/app.js';
 
 const APP = fs.readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
@@ -116,21 +116,222 @@ test('the connection dot is green only for a fresh connection; a stalled one is 
   const now = 5000000;
   const live = (age) => ({ snapshot: { version: '1' }, connected: true, updated: now - age, error: null });
   assert.equal(STALL_MS, 10000);
-  assert.deepEqual(connectionView(live(0), now, false), { on: true, text: 'connected' });
-  assert.deepEqual(connectionView(live(2000), now, false), { on: true, text: 'connected' });
-  assert.deepEqual(connectionView(live(9999), now, false), { on: true, text: 'connected' });
-  assert.deepEqual(connectionView(live(10000), now, false), { on: false, text: 'no update for 10 s' });
-  assert.deepEqual(connectionView(live(10999), now, false), { on: false, text: 'no update for 10 s' });
-  assert.deepEqual(connectionView(live(95400), now, false), { on: false, text: 'no update for 95 s' });
+  assert.deepEqual(connectionView(live(0), now, false), { on: true, stalled: false, text: 'connected' });
+  assert.deepEqual(connectionView(live(2000), now, false), { on: true, stalled: false, text: 'connected' });
+  assert.deepEqual(connectionView(live(9999), now, false), { on: true, stalled: false, text: 'connected' });
+  assert.deepEqual(connectionView(live(10000), now, false), { on: false, stalled: true, text: 'no update for 10 s' });
+  assert.deepEqual(connectionView(live(10999), now, false), { on: false, stalled: true, text: 'no update for 10 s' });
+  assert.deepEqual(connectionView(live(95400), now, false), { on: false, stalled: true, text: 'no update for 95 s' });
 });
 
 test('the connection dot for a dropped connection or a stopped local server is unchanged by the stall rule', () => {
   const now = 5000000;
   const down = (updated, error) => ({ snapshot: null, connected: false, updated, error });
-  assert.deepEqual(connectionView(down(null, 'ssh exited 255: VPS unreachable'), now, false), { on: false, text: 'ssh exited 255: VPS unreachable' });
-  assert.deepEqual(connectionView(down(null, null), now, false), { on: false, text: 'connecting' });
-  assert.deepEqual(connectionView(null, now, false), { on: false, text: 'connecting' });
-  assert.deepEqual(connectionView(down(now - 60000, 'ssh exited 255: VPS unreachable'), now, false), { on: false, text: 'ssh exited 255: VPS unreachable' });
+  const off = (text) => ({ on: false, stalled: false, text });
+  assert.deepEqual(connectionView(down(null, 'ssh exited 255: VPS unreachable'), now, false), off('ssh exited 255: VPS unreachable'));
+  assert.deepEqual(connectionView(down(null, null), now, false), off('connecting'));
+  assert.deepEqual(connectionView(null, now, false), off('connecting'));
+  assert.deepEqual(connectionView(down(now - 60000, 'ssh exited 255: VPS unreachable'), now, false), off('ssh exited 255: VPS unreachable'));
   const stopped = connectionView({ snapshot: {}, connected: true, updated: now, error: null }, now, true);
-  assert.deepEqual(stopped, { on: false, text: 'the local server is not running (tmuxkeep ui was stopped)' });
+  assert.deepEqual(stopped, off('the local server is not running (tmuxkeep ui was stopped)'));
+});
+
+test('the banner: at once for a stall; after 10 seconds grey for any other loss; never while connected', () => {
+  const now = 5000000;
+  const live = { snapshot: {}, connected: true, updated: now - 1000, error: null };
+  const stalled = { snapshot: {}, connected: true, updated: now - 10000, error: null };
+  const dropped = { snapshot: null, connected: false, updated: null, error: 'ssh exited 255: VPS unreachable' };
+  assert.equal(BANNER_AFTER_MS, 10000);
+  assert.equal(bannerDue(connectionView(live, now, false), null, now), false);
+  assert.equal(bannerDue(connectionView(stalled, now, false), now, now), true);
+  assert.equal(bannerDue(connectionView(dropped, now, false), now, now), false);
+  assert.equal(bannerDue(connectionView(dropped, now, false), now - 9999, now), false);
+  assert.equal(bannerDue(connectionView(dropped, now, false), now - 10000, now), true);
+  assert.equal(bannerDue(connectionView(dropped, now, true), now - 10000, now), true);
+  assert.equal(bannerDue(connectionView(dropped, now, false), null, now), false);
+});
+
+test('a table row is six strings, whatever the snapshot holds', () => {
+  assert.deepEqual(rowCells({ name: 'api', state: 'live', attached: true, age_secs: 3700, idle_secs: 4, title: 'build' }),
+    ['api', 'live', '*', '1h', '4s', 'build']);
+  assert.deepEqual(rowCells({ name: 'web', state: 'locked', attached: false }), ['web', 'locked', '', '0s', '0s', '']);
+  assert.deepEqual(rowCells({ name: 'x', state: 'live', title: null }), ['x', 'live', '', '0s', '0s', '']);
+});
+
+// applyPlan: what start() does to the rows of one table body, on a plain array of names.
+function applyPlan(order, plan) {
+  const list = order.filter((n) => !plan.remove.includes(n));
+  for (const { name, before } of plan.inserts) {
+    const at = list.indexOf(name);
+    if (at !== -1) list.splice(at, 1);
+    if (before === null) list.push(name);
+    else list.splice(list.indexOf(before), 0, name);
+  }
+  return list;
+}
+
+test('row plan: rows still wanted are kept; nothing moves when the order did not change', () => {
+  assert.deepEqual(planRows([], []), { remove: [], inserts: [] });
+  assert.deepEqual(planRows(['a', 'b', 'c'], ['a', 'b', 'c']), { remove: [], inserts: [] });
+  assert.deepEqual(planRows(['a', 'b'], ['a', 'b', 'c']), { remove: [], inserts: [{ name: 'c', before: null }] });
+  assert.deepEqual(planRows(['a', 'c'], ['a', 'b', 'c']), { remove: [], inserts: [{ name: 'b', before: 'c' }] });
+  assert.deepEqual(planRows([], ['a', 'b']), { remove: [], inserts: [{ name: 'a', before: null }, { name: 'b', before: null }] });
+  assert.deepEqual(planRows(['a', 'b', 'c'], ['a', 'c']), { remove: ['b'], inserts: [] });
+  assert.deepEqual(planRows(['a', 'b'], []), { remove: ['a', 'b'], inserts: [] });
+  assert.deepEqual(planRows(['a', 'b', 'c'], ['b', 'c', 'a']).remove, []);
+  assert.deepEqual(planRows(['a'], ['a', 'a']), { remove: [], inserts: [] });
+});
+
+test('row plan: applying it always yields the new order (every small reordering, with adds and removals)', () => {
+  const pool = ['a', 'b', 'c', 'd'];
+  const subsets = [];
+  for (let mask = 0; mask < 16; mask += 1) subsets.push(pool.filter((_, i) => mask & (1 << i)));
+  const orders = (items) => (items.length <= 1 ? [items] : items.flatMap((x, i) => orders([...items.slice(0, i), ...items.slice(i + 1)]).map((r) => [x, ...r])));
+  let checked = 0;
+  for (const before of subsets) {
+    for (const after of subsets.flatMap(orders)) {
+      const plan = planRows(before, after);
+      assert.deepEqual(applyPlan(before, plan), after, `${before} -> ${after}`);
+      if (before.join() === after.join()) assert.equal(plan.inserts.length, 0, `${before} did not change`);
+      checked += 1;
+    }
+  }
+  assert.ok(checked > 1000);
+});
+
+test('an action answers ok, error, or auth (auth only on the first try)', () => {
+  assert.equal(actionOutcome({ code: 0, needs_auth: false }, false), 'ok');
+  assert.equal(actionOutcome({ code: 3, needs_auth: false }, false), 'error');
+  assert.equal(actionOutcome({ code: 4, needs_auth: true }, false), 'auth');
+  assert.equal(actionOutcome({ code: 4, needs_auth: true }, true), 'error');
+});
+
+// A fake of everything createActions needs from the page.
+function rig(answers) {
+  const r = { calls: [], notices: [], terminals: [], clockNow: 1000000, success: [] };
+  const queue = [...answers];
+  const actions = createActions({
+    call: async (path, body) => {
+      r.calls.push([path, body]);
+      const next = queue.shift();
+      if (next instanceof Error) throw next;
+      return next;
+    },
+    openTerminal: async (body) => {
+      r.terminals.push(body);
+      return true;
+    },
+    notice: (text, isError) => r.notices.push([text, isError]),
+    now: () => r.clockNow,
+  });
+  r.actions = actions;
+  r.onSuccess = (res) => r.success.push(res.stdout);
+  return r;
+}
+
+const OK = (stdout = '') => ({ status: 200, data: { code: 0, stdout, stderr: '', needs_auth: false } });
+const NEEDS_AUTH = { status: 200, data: { code: 4, stdout: '', stderr: 'tmuxkeep: authentication required\n', needs_auth: true } };
+const withLease = (updated) => ({ snapshot: { lease_secs_left: 1800 }, updated });
+
+test('a refused send keeps its success handler: after the code, the re-send clears the box, once', async () => {
+  const r = rig([NEEDS_AUTH, OK('sent\n')]);
+  const first = await r.actions.act(['send', 'api', 'run the tests'], { onSuccess: r.onSuccess });
+  assert.equal(first.needs_auth, true);
+  assert.deepEqual(r.success, [], 'not finished yet');
+  assert.deepEqual(r.terminals, [{ verb: 'auth' }]);
+  assert.deepEqual(r.notices.at(-1), ['type the code in the terminal that opened', false]);
+  assert.deepEqual(r.actions.pending().words, ['send', 'api', 'run the tests']);
+  // no lease yet, or only a snapshot read before the refusal: nothing happens
+  assert.equal(r.actions.tick({ snapshot: { lease_secs_left: 0 }, updated: r.clockNow + 2000 }), null);
+  assert.equal(r.actions.tick(withLease(r.clockNow - 1)), null);
+  assert.equal(r.calls.length, 1);
+  // a snapshot read after the refusal shows the lease: one re-send, which finishes like the first try
+  r.clockNow += 6000;
+  await r.actions.tick(withLease(r.clockNow - 500));
+  assert.equal(r.calls.length, 2);
+  assert.deepEqual(r.calls[1], ['api/action', { words: ['send', 'api', 'run the tests'] }]);
+  assert.deepEqual(r.success, ['sent\n']);
+  assert.equal(r.actions.pending(), null);
+  assert.equal(r.actions.tick(withLease(r.clockNow + 1000)), null, 'never re-sent twice');
+  assert.equal(r.calls.length, 2);
+});
+
+test('a refused new-session or rename finishes the same way (each keeps its own handler)', async () => {
+  for (const w of [['new', 'api'], ['rename', 'api', 'web']]) {
+    const r = rig([NEEDS_AUTH, OK('done\n')]);
+    await r.actions.act(w, { onSuccess: r.onSuccess });
+    r.clockNow += 3000;
+    await r.actions.tick(withLease(r.clockNow));
+    assert.deepEqual(r.calls[1], ['api/action', { words: w }]);
+    assert.deepEqual(r.success, ['done\n']);
+  }
+});
+
+test('an action that works the first time runs its success handler at once', async () => {
+  const r = rig([OK('created\n')]);
+  await r.actions.act(['new', 'api'], { onSuccess: r.onSuccess });
+  assert.deepEqual(r.success, ['created\n']);
+  assert.equal(r.actions.pending(), null);
+  assert.deepEqual(r.terminals, []);
+});
+
+test('the success handler never runs for a failed re-send, a second refusal, a 409 or a dead server', async () => {
+  const failed = rig([NEEDS_AUTH, { status: 200, data: { code: 3, stdout: '', stderr: 'tmuxkeep: session api is locked\n', needs_auth: false } }]);
+  await failed.actions.act(['send', 'api', 'x'], { onSuccess: failed.onSuccess });
+  failed.clockNow += 3000;
+  await failed.actions.tick(withLease(failed.clockNow));
+  assert.deepEqual(failed.success, []);
+  assert.deepEqual(failed.notices.at(-1), ['exit 3: tmuxkeep: session api is locked', true]);
+  assert.equal(failed.actions.pending(), null);
+
+  const again = rig([NEEDS_AUTH, NEEDS_AUTH]);
+  await again.actions.act(['send', 'api', 'x'], { onSuccess: again.onSuccess });
+  again.clockNow += 3000;
+  await again.actions.tick(withLease(again.clockNow));
+  assert.deepEqual(again.success, []);
+  assert.deepEqual(again.terminals, [{ verb: 'auth' }], 'the terminal opens once');
+  assert.equal(again.actions.pending(), null);
+  assert.deepEqual(again.notices.at(-1), ['exit 4: tmuxkeep: authentication required', true]);
+
+  const busy = rig([{ status: 409, data: { error: 'busy' } }]);
+  assert.equal(await busy.actions.act(['log', '-n', '100'], { onSuccess: busy.onSuccess }), null);
+  assert.deepEqual(busy.success, []);
+  assert.equal(busy.notices.at(-1)[1], true);
+
+  const dead = rig([new Error('connection refused')]);
+  assert.equal(await dead.actions.act(['log', '-n', '100'], { onSuccess: dead.onSuccess }), null);
+  assert.deepEqual(dead.success, []);
+  assert.deepEqual(dead.notices.at(-1), ['the local server did not answer', true]);
+});
+
+test('any other action drops the pending one; so does expiry after 3 minutes', async () => {
+  const other = rig([NEEDS_AUTH, OK('listed\n')]);
+  await other.actions.act(['send', 'api', 'x'], { onSuccess: other.onSuccess });
+  await other.actions.act(['log', '-n', '100']);
+  assert.equal(other.actions.pending(), null);
+  other.clockNow += 5000;
+  assert.equal(other.actions.tick(withLease(other.clockNow)), null);
+  assert.deepEqual(other.success, []);
+  assert.equal(other.calls.length, 2);
+
+  const stale = rig([NEEDS_AUTH]);
+  await stale.actions.act(['send', 'api', 'x'], { onSuccess: stale.onSuccess });
+  stale.clockNow += PENDING_MS;
+  assert.equal(stale.actions.tick(withLease(stale.clockNow)), null);
+  assert.equal(stale.actions.pending(), null);
+  assert.deepEqual(stale.notices.at(-1), ['the action that needed a code was dropped after 3 minutes', true]);
+  assert.equal(stale.calls.length, 1);
+  assert.deepEqual(stale.success, []);
+
+  const attach = rig([NEEDS_AUTH]);
+  await attach.actions.act(['send', 'api', 'x'], { onSuccess: attach.onSuccess });
+  attach.actions.drop();
+  assert.equal(attach.actions.pending(), null);
+});
+
+test('the page has no leftover state field and polls with a timeout and a guard', () => {
+  assert.equal(POLL_TIMEOUT_MS, 3000);
+  assert.ok(!APP.includes('stateAt'));
+  assert.ok(APP.includes('AbortSignal.timeout(POLL_TIMEOUT_MS)'));
+  assert.match(APP, /if \(polling\) \{/);
 });
