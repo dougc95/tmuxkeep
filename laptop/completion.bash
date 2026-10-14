@@ -6,7 +6,7 @@
 # an offline laptop does not wait at every Tab. That ssh is the only place on the laptop's bash side
 # that discards stderr.
 
-_TK_VERBS="new ls peek go send rename lock unlock rm restore resume log auth status"
+_TK_VERBS="new ls peek go send rename lock unlock rm restore resume log auth status ui"
 _TK_NAME_VERBS="peek go send rename lock unlock rm resume"
 
 # _tmuxkeep_mtime FILE: modification time in epoch seconds (GNU stat on Linux, BSD stat elsewhere).

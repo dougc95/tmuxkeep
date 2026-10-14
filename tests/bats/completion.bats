@@ -24,7 +24,7 @@ complete_words() {
 @test "sourcing registers the completer and the two one-line lists" {
   run complete -p tmuxkeep
   [ "$output" = 'complete -F _tmuxkeep tmuxkeep' ]
-  grep -qx '_TK_VERBS="new ls peek go send rename lock unlock rm restore resume log auth status"' "$REPO/laptop/completion.bash"
+  grep -qx '_TK_VERBS="new ls peek go send rename lock unlock rm restore resume log auth status ui"' "$REPO/laptop/completion.bash"
   grep -qx '_TK_NAME_VERBS="peek go send rename lock unlock rm resume"' "$REPO/laptop/completion.bash"
 }
 
@@ -34,7 +34,9 @@ complete_words() {
   run complete_words tmuxkeep st
   [ "$output" = status ]
   run complete_words tmuxkeep ''
-  [ "${#lines[@]}" -eq 14 ]
+  [ "${#lines[@]}" -eq 15 ]
+  run complete_words tmuxkeep u
+  [ "$output" = "$(printf '%s\n' unlock ui)" ]
   [ ! -s "$TK_STUB_LOG" ]
 }
 

@@ -87,6 +87,30 @@ foreach ($w in $words) {
     }
 }
 
+# "ui" is local (spec 5.1): it starts the dashboard server in the foreground and never reaches the
+# broker. Deploy installs the dashboard next to this script, in ~\scripts\tmuxkeep-dashboard.
+if ($words.Count -gt 0 -and $words[0] -ceq 'ui') {
+    $node = @(Get-Command -Name node -CommandType Application -ErrorAction SilentlyContinue)
+    if ($node.Count -eq 0) {
+        Write-Host 'tmuxkeep: node not found; install Node 20 or newer to use the dashboard'
+        exit 2
+    }
+    $dashboard = Join-Path $PSScriptRoot 'tmuxkeep-dashboard'
+    $server = Join-Path $dashboard 'server.js'
+    if (-not (Test-Path -LiteralPath $server -PathType Leaf)) {
+        Write-Host "tmuxkeep: dashboard not installed at $dashboard; run deploy again"
+        exit 2
+    }
+    [string[]]$uiArgs = @($server) + @($words | Select-Object -Skip 1)
+    $global:LASTEXITCODE = $null
+    & $node[0].Source @uiArgs
+    $code = $LASTEXITCODE
+    if ($null -eq $code) {
+        $code = 1
+    }
+    exit $code
+}
+
 # "send <name>" with no text: ask for it locally and send it as one word.
 if ($words.Count -eq 2 -and $words[0] -ceq 'send') {
     $text = Read-Host 'Text to send'

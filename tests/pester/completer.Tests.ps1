@@ -115,6 +115,11 @@ Describe 'profile snippet' {
             ($r.CompletionMatches.CompletionText -join ',') | Should -BeExactly 'status'
         }
 
+        It 'completes the local ui verb for the first word' {
+            $r = TabExpansion2 -inputScript 'tmuxkeep ui' -cursorColumn 11
+            ($r.CompletionMatches.CompletionText -join ',') | Should -BeExactly 'ui'
+        }
+
         It 'completes cached session names after go' {
             Set-Content -LiteralPath (Join-Path $env:TEMP 'tmuxkeep-names.txt') -Value @('api', 'web') -Encoding ascii
             $r = TabExpansion2 -inputScript 'tmuxkeep go a' -cursorColumn 13

@@ -43,6 +43,21 @@ tk_prompt() {
   printf '%s' "$answer"
 }
 
+# tk_ui WORD...: the local ui verb (spec 5.1). Runs node on the dashboard that deploy.sh installs in
+# ~/.local/share/tmuxkeep/dashboard, in the foreground, and returns node's exit code. Never calls ssh.
+tk_ui() {
+  local dir="$HOME/.local/share/tmuxkeep/dashboard"
+  if ! command -v node >/dev/null; then
+    printf 'tmuxkeep: node not found; install Node 20 or newer to use the dashboard\n' >&2
+    return 2
+  fi
+  if [ ! -f "$dir/server.js" ]; then
+    printf 'tmuxkeep: dashboard not installed at %s; run deploy again\n' "$dir" >&2
+    return 2
+  fi
+  node "$dir/server.js" "$@"
+}
+
 # tk_main WORD...: the wrapper; returns ssh's exit code, or 2 for a local usage error.
 tk_main() {
   local w text answer has_now=0 has_confirm=0 rc
@@ -51,6 +66,12 @@ tk_main() {
   for w in "$@"; do
     if [ -z "$w" ]; then printf 'tmuxkeep: empty argument\n' >&2; return 2; fi
   done
+  # "ui" never reaches the broker: it starts the local dashboard server.
+  if [ "$#" -gt 0 ] && [ "$1" = ui ]; then
+    shift
+    tk_ui "$@"
+    return
+  fi
   # "send <name>" with no text: ask for it locally and send it as one word.
   if [ "$#" -eq 2 ] && [ "$1" = send ]; then
     text=$(tk_prompt 'Text to send: ')
