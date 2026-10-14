@@ -730,8 +730,16 @@ verb_lock() { # lock <name>
   succeed locked
 }
 
-verb_auth() { # auth: always prompts for a code, then starts a lease for this key id and client IP
-  (( $# == 0 )) || fail 2 "usage: tmuxkeep auth"
+# auth: always prompts for a code, then starts a lease for this key id and client IP.
+# auth --end (spec 4.2, D18): removes that lease, with no gate and no code (ending a lease needs
+# none), so it is the one verb path that does not call authorize. Succeeds when there is no lease.
+verb_auth() {
+  if (( $# == 1 )) && [[ $1 == --end ]]; then
+    { rm -f -- "$STATE_DIR/leases/$KEY_ID@$CLIENT_IP"; } 2>/dev/null || fail 1 "cannot end lease"
+    printf 'lease ended\n'
+    succeed lease-ended
+  fi
+  (( $# == 0 )) || fail 2 "usage: tmuxkeep auth [--end]"
   authorize
   printf 'authenticated; lease valid for %s\n' "$(humanise "$LEASE_SECS")"
   succeed authenticated

@@ -139,3 +139,17 @@ teardown() { teardown_remote; }
   jq -e '.lease_secs_left == 0 and .lines == 0 and .sessions[0].lines == []' <<<"$output"
   [ ! -s /var/log/tmuxkeep/audit.log ]
 }
+
+@test "remote: auth --end removes only the lease of this key id and client IP" {
+  local now
+  now=$(date +%s)
+  printf '%s\n' "$now" > /home/claude/.tmuxkeep/leases/laptop@203.0.113.9
+  printf '%s\n' "$now" > /home/claude/.tmuxkeep/leases/laptop@198.51.100.7
+  run remote 203.0.113.9 laptop "$(b64cmd auth --end)"
+  [ "$status" -eq 0 ]
+  [ "$output" = 'lease ended' ]
+  [ ! -e /home/claude/.tmuxkeep/leases/laptop@203.0.113.9 ]
+  [ -e /home/claude/.tmuxkeep/leases/laptop@198.51.100.7 ]
+  [ "$(jq -r .detail <<<"$(remote_audit_last)")" = lease-ended ]
+  [ "$(jq -r .ip <<<"$(remote_audit_last)")" = 203.0.113.9 ]
+}

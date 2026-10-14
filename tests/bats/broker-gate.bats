@@ -271,3 +271,59 @@ STUB
   [ "$(audit_field ok)" = false ]
   [ "$(audit_field detail)" = otp-fail ]
 }
+
+@test "auth --end removes this key id's lease without a code, prints lease ended and audits lease-ended" {
+  mk_lease t -
+  mk_lease other -
+  run --separate-stderr tmuxkeep auth --end
+  [ "$status" -eq 0 ]
+  [ "$output" = 'lease ended' ]
+  [ -z "$stderr" ]
+  [ ! -e "$TMUXKEEP_HOME/leases/t@-" ]
+  [ -e "$TMUXKEEP_HOME/leases/other@-" ]
+  [ "$(audit_field verb)" = auth ]
+  [ "$(audit_field ok)" = true ]
+  [ "$(audit_field detail)" = lease-ended ]
+  [ ! -s "$OATH_STUB_LOG" ]
+}
+
+@test "auth --end succeeds when there is no lease, and needs no terminal" {
+  run tmuxkeep auth --end
+  [ "$status" -eq 0 ]
+  [ "$output" = 'lease ended' ]
+}
+
+@test "after auth --end a gated verb asks for a code again" {
+  mk_lease t -
+  run tmuxkeep auth --end
+  [ "$status" -eq 0 ]
+  run --separate-stderr tmuxkeep unlock api
+  [ "$status" -eq 4 ]
+  [[ "$stderr" == *'TOTP required'* ]]
+  [ "$(locked_flag api)" = 1 ]
+}
+
+@test "auth --end does not take the gate: it works during a cooldown and a hard lock" {
+  mk_lease t -
+  printf '%s\n' $(( TMUXKEEP_NOW - 3 )) $(( TMUXKEEP_NOW - 2 )) $(( TMUXKEEP_NOW - 1 )) > "$(fails_file)"
+  : > "$TMUXKEEP_HOME/otp-locked"
+  run tmuxkeep auth --end
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMUXKEEP_HOME/leases/t@-" ]
+  [ ! -e "$TMUXKEEP_HOME/gate.lock" ]
+}
+
+@test "auth with any argument other than exactly --end is a usage error, audited" {
+  local a
+  for a in --frob --END end; do
+    run --separate-stderr tmuxkeep auth "$a"
+    [ "$status" -eq 2 ] || { echo "auth $a gave $status"; return 1; }
+    [ "$stderr" = 'tmuxkeep: usage: tmuxkeep auth [--end]' ]
+  done
+  run tmuxkeep auth --end --end
+  [ "$status" -eq 2 ]
+  run tmuxkeep auth --end extra
+  [ "$status" -eq 2 ]
+  [ "$(audit_field ok)" = false ]
+  [ "$(audit_field verb)" = auth ]
+}
