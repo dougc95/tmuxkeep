@@ -6,13 +6,12 @@
 // config error, or a Node older than 20. TMUXKEEP_NODE_VERSION stands in for the Node version in tests.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { configPath, parseArgs, readConfig } from './lib/config.js';
 import { createFollower, FOLLOW_WORDS } from './lib/follow.js';
-import { createHandler, SERVER_OPTIONS } from './lib/http.js';
+import { createHandler, createServer } from './lib/http.js';
 import { runVerb, spawnSsh } from './lib/ssh.js';
 import { openBrowser, openTerminal } from './lib/terminal.js';
 
@@ -61,7 +60,7 @@ const handler = createHandler({
 });
 
 // 4. 127.0.0.1 only: never 0.0.0.0, never ::.
-const server = http.createServer(SERVER_OPTIONS, handler);
+const server = createServer(handler);
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') quit(1, `tmuxkeep ui: port ${port} is in use; set DASHBOARD_PORT or pass --port`);
   quit(1, `tmuxkeep ui: cannot listen on 127.0.0.1:${port}: ${err.code || err.message}`);

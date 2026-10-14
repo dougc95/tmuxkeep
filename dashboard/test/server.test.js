@@ -167,6 +167,29 @@ test('the server listens on 127.0.0.1 only, not on ::1', async () => {
   }
 });
 
+test('the real server answers a request it cannot parse with the security headers', async () => {
+  const port = await freePort();
+  const run = start(['--port', String(port), '--no-open'], envFor(home()));
+  try {
+    await waitFor(() => run.out().includes('Ctrl-C stops'));
+    const reply = await new Promise((resolve) => {
+      const sock = net.connect(port, '127.0.0.1', () => sock.write('GARBAGE\r\n\r\n'));
+      let data = '';
+      sock.setEncoding('utf8');
+      sock.on('data', (c) => { data += c; });
+      sock.on('error', () => {});
+      sock.on('close', () => resolve(data));
+      setTimeout(() => sock.destroy(), 3000);
+    });
+    assert.match(reply, /^HTTP\/1\.1 400 Bad Request\r\n/);
+    assert.match(reply, /\r\nContent-Security-Policy: default-src 'none'; /);
+    assert.match(reply, /\r\nCache-Control: no-store\r\n/);
+    assert.ok(!/access-control/i.test(reply));
+  } finally {
+    await stop(run);
+  }
+});
+
 test('--port wins over DASHBOARD_PORT; without --no-open the browser command is printed in dry run', async () => {
   const port = await freePort();
   const run = start(['--port', String(port)], envFor(home('DASHBOARD_PORT=1024\n')));
@@ -181,18 +204,35 @@ test('--port wins over DASHBOARD_PORT; without --no-open the browser command is 
   }
 });
 
-test('SIGTERM stops the server with exit 0', { skip: process.platform === 'win32' ? 'Windows has no catchable SIGTERM' : false }, async () => {
+// exited(run, ms): the exit of the server child, or a rejection when it has not ended after ms.
+function exited(run, ms = 5000) {
+  let timer;
+  const late = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error('the server did not exit')), ms);
+  });
+  return Promise.race([run.exit, late]).finally(() => clearTimeout(timer));
+}
+
+// On Windows child.kill() ends the child outright and runs none of its signal handlers (Node does run a
+// SIGINT handler on a console Ctrl-C, which a test cannot send), so the two signal tests are POSIX only.
+const NO_SIGNALS = process.platform === 'win32' ? 'on Windows child.kill() ends the child without running its signal handlers' : false;
+
+test('SIGTERM stops the server with exit 0', { skip: NO_SIGNALS }, async () => {
   const port = await freePort();
   const run = start(['--port', String(port), '--no-open'], envFor(home()));
-  await waitFor(() => run.out().includes('Ctrl-C stops'));
-  run.child.kill('SIGTERM');
-  assert.deepEqual(await run.exit, { code: 0, signal: null });
+  try {
+    await waitFor(() => run.out().includes('Ctrl-C stops'));
+    run.child.kill('SIGTERM');
+    assert.deepEqual(await exited(run), { code: 0, signal: null });
+  } finally {
+    await stop(run);
+  }
 });
 
 // An ssh stand-in that records its process id and then stays alive for at most 20 seconds.
 const PID_SSH = "import fs from 'node:fs';\nfs.writeFileSync(`${process.argv[1]}.pid`, String(process.pid));\nsetTimeout(() => {}, 20000);\n";
 
-test('Ctrl-C stops the follow connection too: no ssh child outlives the server', { skip: process.platform === 'win32' ? 'Windows has no catchable SIGINT' : false }, async () => {
+test('Ctrl-C stops the follow connection too: no ssh child outlives the server', { skip: NO_SIGNALS }, async () => {
   const port = await freePort();
   const fake = path.join(tempDir(), 'fake-ssh.js');
   fs.writeFileSync(fake, PID_SSH);
@@ -204,7 +244,7 @@ test('Ctrl-C stops the follow connection too: no ssh child outlives the server',
     pid = Number(await waitFor(() => (fs.existsSync(`${fake}.pid`) ? fs.readFileSync(`${fake}.pid`, 'utf8') : '')));
     assert.ok(pid > 0);
     run.child.kill('SIGINT');
-    assert.deepEqual(await run.exit, { code: 0, signal: null });
+    assert.deepEqual(await exited(run), { code: 0, signal: null });
     const gone = () => {
       try {
         process.kill(pid, 0);
