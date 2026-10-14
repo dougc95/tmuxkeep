@@ -190,7 +190,10 @@ for every method, before anything else happens.
 POST requirements, each failing with `403` empty body: `Content-Type` is
 `application/json`; `Origin`, when present, equals `http://127.0.0.1:<port>` or
 `http://localhost:<port>`; `Sec-Fetch-Site`, when present, is `same-origin` or `none`;
-body at most 70,000 bytes and valid JSON. Every response carries
+body at most 140,000 bytes and valid JSON (ruling 2026-10-14: a maximal `send` text can
+double under JSON escaping; a `Content-Length` over the limit is refused before reading,
+and the connection is closed after an overflow). Node's own error replies
+(`clientError`, `Expect`) go through the same checks and headers. Every response carries
 `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
 `Referrer-Policy: no-referrer`, and the page carries
 `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self';
