@@ -47,18 +47,20 @@ export function runVerb(words, { timeoutMs = ACTION_TIMEOUT_MS, env = process.en
       if (extra) stderr += (stderr === '' || stderr.endsWith('\n') ? '' : '\n') + extra + '\n';
       resolve({ code, stdout, stderr, needs_auth: code === 4 && stderr.includes('TOTP required') });
     };
+    const cannotRun = (err) => finish(1, `tmuxkeep ui: cannot run ssh: ${err.code || err.message}`);
     let child;
     try {
       child = spawnSsh(words, env);
+      // The 'error' listener comes first: for EMFILE and ENFILE spawn returns a child with no stdio
+      // streams and reports the failure later as an 'error' event, which must never go unhandled.
+      child.on('error', cannotRun);
+      for (const stream of [child.stdout, child.stderr]) stream?.setEncoding('utf8');
+      child.stdout?.on('data', (s) => { stdout = capped(stdout, s); });
+      child.stderr?.on('data', (s) => { stderr = capped(stderr, s); });
     } catch (err) {
-      finish(1, `tmuxkeep ui: cannot run ssh: ${err.code || err.message}`);
+      cannotRun(err);
       return;
     }
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (s) => { stdout = capped(stdout, s); });
-    child.stderr.on('data', (s) => { stderr = capped(stderr, s); });
-    child.on('error', (err) => finish(1, `tmuxkeep ui: cannot run ssh: ${err.code || err.message}`));
     child.on('close', (code) => {
       if (timedOut) finish(124, `tmuxkeep ui: no answer within ${Math.round(timeoutMs / 1000)} seconds; ssh was stopped`);
       else finish(code === null ? 1 : code);

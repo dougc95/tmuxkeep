@@ -82,3 +82,17 @@ test('stdout and stderr are each kept to exactly MAX_OUTPUT_CHARS, cut inside th
   assert.equal(r.stdout, head + 'b'.repeat(10));
   assert.equal(r.stderr, head + 'b'.repeat(10));
 });
+
+// The same answer when spawn throws at once instead of reporting an 'error' event later: a word so
+// long that its encoded argument cannot be passed to any process (ENAMETOOLONG on Windows, E2BIG on
+// Linux). The stub must never have started.
+test('a word too long for any command line is code 1 with the reason, and nothing throws', async () => {
+  const s = stubPlan({ send: [{ steps: [{ out: 'sent\n' }], code: 0 }] });
+  const r = await runVerb(['send', 'api', 'a'.repeat(3000000)], { env: s.env });
+  assert.equal(r.code, 1);
+  assert.equal(r.needs_auth, false);
+  assert.equal(r.stdout, '');
+  assert.ok(r.stderr.startsWith('tmuxkeep ui: cannot run ssh: '), r.stderr);
+  assert.ok(r.stderr.endsWith('\n'));
+  assert.equal(s.calls().length, 0);
+});
