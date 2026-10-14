@@ -260,3 +260,23 @@ install_dashboard() {
   run tk_main UI
   [ "$(stub_calls)" = "$(line_for 0 UI)" ]
 }
+
+# hex_word HEX: the bytes HEX spells, two hex digits per byte (printf %b with \0NNN works in bash 3.2).
+hex_word() {
+  local h=$1 esc=''
+  while [ -n "$h" ]; do
+    esc="$esc\0$(printf '%03o' "0x${h%"${h#??}"}")"
+    h=${h#??}
+  done
+  printf '%b' "$esc"
+}
+
+@test "every shared b64 case in tests/fixtures/b64-words encodes to its token" {
+  local label hex token n=0
+  while read -r label hex token; do
+    case $label in ''|'#'*) continue ;; esac
+    [ "$(tk_encode "$(hex_word "$hex")")" = "$token" ] || { echo "case $label"; return 1; }
+    n=$((n + 1))
+  done < "$REPO/tests/fixtures/b64-words"
+  [ "$n" -eq 15 ]
+}

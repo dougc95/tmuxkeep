@@ -209,6 +209,19 @@ Describe 'tmuxkeep.ps1' {
         }
     }
 
+    Describe 'shared b64 cases' {
+        It 'encodes every case of tests\fixtures\b64-words to its token' {
+            . $Wrapper
+            $cases = @(Get-Content -LiteralPath (Join-Path $Repo 'tests\fixtures\b64-words') | Where-Object { $_ -and -not $_.StartsWith('#') })
+            $cases.Count | Should -Be 15
+            foreach ($case in $cases) {
+                $label, $hex, $token = $case -split ' '
+                $bytes = [byte[]]@(for ($i = 0; $i -lt $hex.Length; $i += 2) { [Convert]::ToByte($hex.Substring($i, 2), 16) })
+                ConvertTo-TmuxkeepToken ([Text.Encoding]::UTF8.GetString($bytes)) | Should -BeExactly $token -Because $label
+            }
+        }
+    }
+
     Describe 'ui verb (local, spec 5.1)' {
         BeforeAll {
             # A home whose path has a space (Review Focus 2), with the wrapper installed the way deploy does it.

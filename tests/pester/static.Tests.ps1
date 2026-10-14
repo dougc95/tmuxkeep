@@ -50,9 +50,9 @@ Describe 'LF-only files (spec 9.5)' {
 }
 
 Describe '.gitattributes' {
-    It 'forces LF on the laptop bash files, vps and tests, and leaves the PowerShell files alone' {
+    It 'forces LF on the laptop bash files, vps, tests and the dashboard, and leaves the PowerShell files alone' {
         $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-        foreach ($p in 'laptop/tmuxkeep.sh', 'laptop/deploy.sh', 'laptop/completion.bash', 'vps/tmuxkeep', 'tests/smoke.sh') {
+        foreach ($p in 'laptop/tmuxkeep.sh', 'laptop/deploy.sh', 'laptop/completion.bash', 'vps/tmuxkeep', 'tests/smoke.sh', 'dashboard/server.js', 'dashboard/public/app.js') {
             ((& git -C $repo check-attr eol -- $p) -join '') | Should -BeExactly ($p + ': eol: lf')
         }
         ((& git -C $repo check-attr eol -- 'laptop/deploy.ps1') -join '') | Should -BeExactly 'laptop/deploy.ps1: eol: unspecified'

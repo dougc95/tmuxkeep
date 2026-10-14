@@ -31,6 +31,7 @@ conf_keys_ps()   { tr -d '\r' < "$REPO/laptop/deploy.ps1" | sed -n 's/^function 
 conf_keys_bash() { sed -n 's/^TK_CONF_KEYS="\([^"]*\)"$/\1/p' "$REPO/laptop/deploy.sh"; }
 deploy_conf_keys_setup() { sed -n "s/^DEPLOY_CONF_KEYS='\([^']*\)'\$/\1/p" "$REPO/vps/tmuxkeep-setup"; }
 deploy_conf_keys_fixture() { sed -n 's/^\([A-Z_]*\)=.*/\1/p' "$REPO/tests/fixtures/deploy.conf" | tr '\n' ' ' | sed 's/ $//'; }
+action_verbs() { sed -n "s/^export const ACTION_VERBS = \[\(.*\)];\$/\1/p" "$REPO/dashboard/lib/validate.js" | ps_list; }
 
 @test "the gated verb list is the same in the broker and both wrappers" {
   local want='auth go new rename resume rm send unlock' b p s
@@ -107,4 +108,15 @@ deploy_conf_keys_fixture() { sed -n 's/^\([A-Z_]*\)=.*/\1/p' "$REPO/tests/fixtur
   i=$(deploy_conf_keys_setup); one_line 'installer DEPLOY_CONF_KEYS' "$i"
   f=$(deploy_conf_keys_fixture); [ -n "$f" ] || { echo "fixture deploy.conf: no KEY=value lines"; return 1; }
   [ "$i" = "$f" ] || { echo "installer: $i"; echo "fixture:   $f"; return 1; }
+}
+
+@test "the dashboard's action allowlist is a subset of the broker's verbs, without go, ui or reap" {
+  local a v broker
+  a=$(action_verbs); one_line 'dashboard ACTION_VERBS' "$a"
+  broker=" $(broker_verbs | tr '\n' ' ') "
+  for v in $a; do
+    case $broker in *" $v "*) ;; *) echo "not a broker verb: $v"; return 1 ;; esac
+    case $v in go|ui|reap) echo "must not be allowed: $v"; return 1 ;; esac
+  done
+  [ "$(printf '%s' "$a" | sorted_words)" = 'auth lock log new peek rename restore resume rm send status unlock' ]
 }
