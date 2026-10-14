@@ -33,3 +33,7 @@ OTP_HARD_MAX=10
 OTP_READ_TIMEOUT=60
 # Largest text that send accepts, in bytes (1-65536).
 SEND_MAX_BYTES=8000
+# Loopback port for tmuxkeep ui (1024-65535).
+DASHBOARD_PORT=7707
+# Program that opens a terminal for go and auth; empty picks the platform default.
+TERMINAL_CMD=

@@ -29,6 +29,8 @@ reason() {
   [ "$TKC_KEY" = '~/.ssh/id_tmuxkeep_ed25519' ]
   [ "$TKC_RESUME_CMD" = 'claude --continue' ]
   [ "$TKC_SEND_MAX_BYTES" = 8000 ]
+  [ "$TKC_DASHBOARD_PORT" = 7707 ]
+  [ -z "$TKC_TERMINAL_CMD" ]
 }
 
 @test "tk_conf_text for the defaults and HOST=203.0.113.10 is the fixture, byte for byte" {
@@ -52,6 +54,16 @@ reason() {
   [ "$TKC_PORT" = 22 ]
   grep -v '^HOST=' "$FIX" > "$C"
   [ "$(reason "$C")" = "$C: HOST: required" ]
+}
+
+@test "a config written before the dashboard keys existed reads with their defaults (spec 5.2)" {
+  grep -v -e '^DASHBOARD_PORT=' -e '^TERMINAL_CMD=' -e '^# Loopback port' -e '^# Program that opens' "$FIX" > "$C"
+  [ "$(grep -c -e DASHBOARD -e TERMINAL "$C")" -eq 0 ]
+  TKC_DASHBOARD_PORT=1
+  TKC_TERMINAL_CMD=x
+  tk_conf_read "$C"
+  [ "$TKC_DASHBOARD_PORT" = 7707 ]
+  [ -z "$TKC_TERMINAL_CMD" ]
 }
 
 @test "blank lines, comments, padding and a repeated key (the last wins)" {
@@ -98,11 +110,16 @@ OTP_HARD_MAX|101|OTP_HARD_MAX: must be an integer from 3 to 100
 OTP_READ_TIMEOUT|601|OTP_READ_TIMEOUT: must be an integer from 10 to 600
 SEND_MAX_BYTES|0|SEND_MAX_BYTES: must be an integer from 1 to 65536
 SEND_MAX_BYTES|65537|SEND_MAX_BYTES: must be an integer from 1 to 65536
+DASHBOARD_PORT|1023|DASHBOARD_PORT: must be an integer from 1024 to 65535
+DASHBOARD_PORT|65536|DASHBOARD_PORT: must be an integer from 1024 to 65535
+DASHBOARD_PORT||DASHBOARD_PORT: must be an integer from 1024 to 65535
 EOF
   with_line LAUNCH_CMD "$(printf 'x%.0s' $(seq 1 201))"
   [ "$(reason "$C")" = "$C: LAUNCH_CMD: at most 200 characters" ]
   with_line RESUME_CMD "$(printf 'x%.0s' $(seq 1 201))"
   [ "$(reason "$C")" = "$C: RESUME_CMD: at most 200 characters" ]
+  with_line TERMINAL_CMD "$(printf 'x%.0s' $(seq 1 201))"
+  [ "$(reason "$C")" = "$C: TERMINAL_CMD: at most 200 characters" ]
 }
 
 @test "accepts the bounds and the edge values" {
@@ -121,6 +138,9 @@ LEASE_SECS|0060
 TOMBSTONE_TTL|2592000
 OTP_HARD_MAX|3
 SEND_MAX_BYTES|65536
+DASHBOARD_PORT|1024
+DASHBOARD_PORT|65535
+TERMINAL_CMD|wezterm start --
 EOF
 }
 
@@ -260,6 +280,7 @@ EOF
   printf '%s\n' "$output" | grep -qx 'LAUNCH_CMD='
   printf '%s\n' "$output" | grep -qx 'LEASE_SECS=600'
   [ "$(printf '%s\n' "$output" | grep -cE 'HOST|PORT|KEY=')" = 0 ]
+  [ "$(tk_deploy_conf_text | grep -c -e DASHBOARD -e TERMINAL)" -eq 0 ]
 }
 
 @test "tk_expand_path expands only a leading tilde" {
@@ -270,5 +291,5 @@ EOF
 }
 
 @test "the key list is one line" {
-  grep -qx 'TK_CONF_KEYS="HOST PORT USER KEY ADMIN_KEY LAUNCH_CMD RESUME_CMD INSTALL_CLAUDE_CODE LEASE_SECS TOMBSTONE_TTL OTP_FAIL_MAX OTP_FAIL_WINDOW OTP_COOLDOWN OTP_HARD_MAX OTP_READ_TIMEOUT SEND_MAX_BYTES"' "$REPO/laptop/deploy.sh"
+  grep -qx 'TK_CONF_KEYS="HOST PORT USER KEY ADMIN_KEY LAUNCH_CMD RESUME_CMD INSTALL_CLAUDE_CODE LEASE_SECS TOMBSTONE_TTL OTP_FAIL_MAX OTP_FAIL_WINDOW OTP_COOLDOWN OTP_HARD_MAX OTP_READ_TIMEOUT SEND_MAX_BYTES DASHBOARD_PORT TERMINAL_CMD"' "$REPO/laptop/deploy.sh"
 }

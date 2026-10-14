@@ -98,6 +98,9 @@ stage_dirs() { find "$TMPDIR" -maxdepth 1 -name 'tmuxkeep-stage-*'; }
   cmp "$HOME/.tmuxkeep/completion.bash" "$REPO/laptop/completion.bash"
   grep -qx '# >>> tmuxkeep' "$HOME/.bashrc"
   cmp "$HOME/.ssh/config" "$REPO/tests/fixtures/ssh-block"
+  cmp "$HOME/.local/share/tmuxkeep/dashboard/server.js" "$REPO/dashboard/server.js"
+  [ -f "$HOME/.local/share/tmuxkeep/dashboard/public/app.js" ]
+  [ ! -e "$HOME/.local/share/tmuxkeep/dashboard/test" ]
 }
 
 @test "an existing ssh config gets the block at the top, an existing rc file gets it at the end, and a second deploy replaces both in place" {
@@ -382,4 +385,31 @@ $MSG_KEYCHAIN" ]
   export TK_STUB_SSH_G="$BATS_TEST_TMPDIR/ssh-g"
   run --separate-stderr deploy --init
   [ "$status" -eq 0 ] || { echo "$stderr"; return 1; }
+}
+
+@test "the dashboard is replaced on every deploy, its place is printed, and a failing installer leaves it alone" {
+  local dash="$HOME/.local/share/tmuxkeep/dashboard"
+  mkdir -p "$dash"
+  printf 'old\n' > "$dash/stale.js"
+  export TK_STUB_SSH_RC=3
+  run --separate-stderr deploy
+  [ "$status" -eq 3 ]
+  [ -f "$dash/stale.js" ]
+  [[ "$stderr" != *'dashboard: installed'* ]]
+  unset TK_STUB_SSH_RC
+  run --separate-stderr deploy
+  [ "$status" -eq 0 ] || { echo "$stderr"; return 1; }
+  [ ! -e "$dash/stale.js" ]
+  [ -f "$dash/server.js" ]
+  [[ "$stderr" == *"dashboard: installed at $dash (run: tmuxkeep ui)"* ]]
+  [[ "$output" != *'dashboard:'* ]]
+}
+
+@test "tk_install_dashboard refuses a folder that is not .../tmuxkeep/dashboard and touches nothing" {
+  mkdir -p "$BATS_TEST_TMPDIR/precious"
+  printf 'keep\n' > "$BATS_TEST_TMPDIR/precious/keep.txt"
+  run "$BASH" -c '. "$1"; tk_install_dashboard "$2" "$3" || { printf "%s\n" "$TK_ERR"; exit 1; }' _ "$R/laptop/deploy.sh" "$R" "$BATS_TEST_TMPDIR/precious"
+  [ "$status" -eq 1 ]
+  [ "$output" = "refusing to replace $BATS_TEST_TMPDIR/precious: the folder must be .../tmuxkeep/dashboard" ]
+  [ -f "$BATS_TEST_TMPDIR/precious/keep.txt" ]
 }

@@ -25,14 +25,14 @@ stub_calls() { cat "$TK_STUB_LOG"; }
 # b64 WORD: the token the wrapper sends for WORD.
 b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 
-# mk_repo_copy: prints the path of a fresh one-commit git repository holding copies of laptop/ and
-# vps/. deploy.sh runs from there, so no test depends on the real checkout's .git (a worktree's
-# .git file points at a Windows path that does not exist inside Docker).
+# mk_repo_copy: prints the path of a fresh one-commit git repository holding copies of laptop/, vps/
+# and dashboard/. deploy.sh runs from there, so no test depends on the real checkout's .git (a
+# worktree's .git file points at a Windows path that does not exist inside Docker).
 mk_repo_copy() {
   local r="$BATS_TEST_TMPDIR/repo"
   rm -rf "$r"
   mkdir -p "$r"
-  cp -R "$REPO/laptop" "$REPO/vps" "$r/"
+  cp -R "$REPO/laptop" "$REPO/vps" "$REPO/dashboard" "$r/"
   git -c init.defaultBranch=main init -q "$r"
   git -C "$r" add -A
   git -C "$r" -c user.email=test@example.invalid -c user.name=test commit -q -m test

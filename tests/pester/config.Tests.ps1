@@ -42,13 +42,15 @@ Describe 'laptop config' {
 
     AfterAll { $env:PATH = $OldPath }
 
-    It 'reads the fixture into the sixteen keys, in file order' {
+    It 'reads the fixture into the eighteen keys, in file order' {
         $v = Read-TmuxkeepConfig -Path (New-Cfg $Fixture)
-        (@($v.Keys) -join ' ') | Should -BeExactly 'HOST PORT USER KEY ADMIN_KEY LAUNCH_CMD RESUME_CMD INSTALL_CLAUDE_CODE LEASE_SECS TOMBSTONE_TTL OTP_FAIL_MAX OTP_FAIL_WINDOW OTP_COOLDOWN OTP_HARD_MAX OTP_READ_TIMEOUT SEND_MAX_BYTES'
+        (@($v.Keys) -join ' ') | Should -BeExactly 'HOST PORT USER KEY ADMIN_KEY LAUNCH_CMD RESUME_CMD INSTALL_CLAUDE_CODE LEASE_SECS TOMBSTONE_TTL OTP_FAIL_MAX OTP_FAIL_WINDOW OTP_COOLDOWN OTP_HARD_MAX OTP_READ_TIMEOUT SEND_MAX_BYTES DASHBOARD_PORT TERMINAL_CMD'
         $v['HOST'] | Should -BeExactly '203.0.113.10'
         $v['PORT'] | Should -BeExactly '22'
         $v['KEY'] | Should -BeExactly '~/.ssh/id_tmuxkeep_ed25519'
         $v['RESUME_CMD'] | Should -BeExactly 'claude --continue'
+        $v['DASHBOARD_PORT'] | Should -BeExactly '7707'
+        $v['TERMINAL_CMD'] | Should -BeExactly ''
     }
 
     It 'Write-TmuxkeepConfig reproduces the fixture byte for byte, creating the folder' {
@@ -64,6 +66,14 @@ Describe 'laptop config' {
         $v['PORT'] | Should -BeExactly '22'
         $p = New-Cfg ([regex]::Replace($Fixture, '(?m)^HOST=.*\n', ''))
         Get-Reason $p | Should -BeExactly ('config ' + $p + ': HOST: required')
+    }
+
+    It 'a config written before the dashboard keys existed reads with their defaults (spec 5.2)' {
+        $old = [regex]::Replace($Fixture, '(?m)^(# Loopback port.*|DASHBOARD_PORT=.*|# Program that opens.*|TERMINAL_CMD=.*)\n', '')
+        $old | Should -Not -Match 'DASHBOARD_PORT|TERMINAL_CMD'
+        $v = Read-TmuxkeepConfig -Path (New-Cfg $old)
+        $v['DASHBOARD_PORT'] | Should -BeExactly '7707'
+        $v['TERMINAL_CMD'] | Should -BeExactly ''
     }
 
     It 'skips blank and comment lines, trims padding, and lets the last repeated key win' {
@@ -104,6 +114,10 @@ Describe 'laptop config' {
         @{ Name = 'OTP_READ_TIMEOUT 601';       Key = 'OTP_READ_TIMEOUT';    Value = '601';               Reason = 'OTP_READ_TIMEOUT: must be an integer from 10 to 600' }
         @{ Name = 'SEND_MAX_BYTES 0';           Key = 'SEND_MAX_BYTES';      Value = '0';                 Reason = 'SEND_MAX_BYTES: must be an integer from 1 to 65536' }
         @{ Name = 'SEND_MAX_BYTES 65537';       Key = 'SEND_MAX_BYTES';      Value = '65537';             Reason = 'SEND_MAX_BYTES: must be an integer from 1 to 65536' }
+        @{ Name = 'DASHBOARD_PORT 1023';        Key = 'DASHBOARD_PORT';      Value = '1023';              Reason = 'DASHBOARD_PORT: must be an integer from 1024 to 65535' }
+        @{ Name = 'DASHBOARD_PORT 65536';       Key = 'DASHBOARD_PORT';      Value = '65536';             Reason = 'DASHBOARD_PORT: must be an integer from 1024 to 65535' }
+        @{ Name = 'an empty DASHBOARD_PORT';    Key = 'DASHBOARD_PORT';      Value = '';                  Reason = 'DASHBOARD_PORT: must be an integer from 1024 to 65535' }
+        @{ Name = 'a 201-character TERMINAL_CMD'; Key = 'TERMINAL_CMD';      Value = ('x' * 201);         Reason = 'TERMINAL_CMD: at most 200 characters' }
     ) {
         $p = New-Cfg (Set-Line $Fixture $Key $Value)
         Get-Reason $p | Should -BeExactly ('config ' + $p + ': ' + $Reason)
@@ -120,6 +134,10 @@ Describe 'laptop config' {
         @{ Name = 'TOMBSTONE_TTL 2592000';  Key = 'TOMBSTONE_TTL';  Value = '2592000' }
         @{ Name = 'OTP_HARD_MAX 3';         Key = 'OTP_HARD_MAX';   Value = '3' }
         @{ Name = 'SEND_MAX_BYTES 65536';   Key = 'SEND_MAX_BYTES'; Value = '65536' }
+        @{ Name = 'DASHBOARD_PORT 1024';    Key = 'DASHBOARD_PORT'; Value = '1024' }
+        @{ Name = 'DASHBOARD_PORT 65535';   Key = 'DASHBOARD_PORT'; Value = '65535' }
+        @{ Name = 'a TERMINAL_CMD';         Key = 'TERMINAL_CMD';   Value = 'wezterm start --' }
+        @{ Name = 'a 200-character TERMINAL_CMD'; Key = 'TERMINAL_CMD'; Value = ('x' * 200) }
     ) {
         Get-Reason (New-Cfg (Set-Line $Fixture $Key $Value)) | Should -BeExactly 'no error'
     }
@@ -219,6 +237,7 @@ Describe 'laptop config' {
         $t | Should -Match '(?m)^LAUNCH_CMD=$'
         $t | Should -Match '(?m)^LEASE_SECS=600$'
         $t | Should -Not -Match 'HOST|PORT|KEY='
+        $t | Should -Not -Match 'DASHBOARD|TERMINAL'
     }
 
     It 'Expand-TmuxkeepPath expands only a leading tilde' {

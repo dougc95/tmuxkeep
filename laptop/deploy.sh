@@ -7,7 +7,7 @@
 # a child process from a temporary git copy, with stub ssh, scp and ssh-keygen first on PATH and
 # HOME in a temp directory. bash 3.2 rules: no bash 4 features, no set -u, no GNU-only tools.
 
-TK_CONF_KEYS="HOST PORT USER KEY ADMIN_KEY LAUNCH_CMD RESUME_CMD INSTALL_CLAUDE_CODE LEASE_SECS TOMBSTONE_TTL OTP_FAIL_MAX OTP_FAIL_WINDOW OTP_COOLDOWN OTP_HARD_MAX OTP_READ_TIMEOUT SEND_MAX_BYTES"
+TK_CONF_KEYS="HOST PORT USER KEY ADMIN_KEY LAUNCH_CMD RESUME_CMD INSTALL_CLAUDE_CODE LEASE_SECS TOMBSTONE_TTL OTP_FAIL_MAX OTP_FAIL_WINDOW OTP_COOLDOWN OTP_HARD_MAX OTP_READ_TIMEOUT SEND_MAX_BYTES DASHBOARD_PORT TERMINAL_CMD"
 # The eight files staged from vps/, in this order (spec 6.1 step 4). One line on purpose: a parity test reads it.
 TK_VPS_FILES="tmuxkeep tmuxkeep-setup vps-facts.sh sshd.conf.tmpl sudoers.tmpl tmux.conf systemd/tmuxkeep-reaper.service systemd/tmuxkeep-reaper.timer"
 
@@ -33,6 +33,8 @@ tk_conf_defaults() {
   TKC_OTP_HARD_MAX=10
   TKC_OTP_READ_TIMEOUT=60
   TKC_SEND_MAX_BYTES=8000
+  TKC_DASHBOARD_PORT=7707
+  TKC_TERMINAL_CMD=''
 }
 
 # tk_trim STRING: sets TK_TRIMMED to STRING without leading and trailing spaces and tabs. The C
@@ -104,6 +106,8 @@ tk_conf_validate() {
   tk_check_int OTP_HARD_MAX "$TKC_OTP_HARD_MAX" $(( 10#$TKC_OTP_FAIL_MAX )) 100 || return 1
   tk_check_int OTP_READ_TIMEOUT "$TKC_OTP_READ_TIMEOUT" 10 600 || return 1
   tk_check_int SEND_MAX_BYTES "$TKC_SEND_MAX_BYTES" 1 65536 || return 1
+  tk_check_int DASHBOARD_PORT "$TKC_DASHBOARD_PORT" 1024 65535 || return 1
+  if [ "${#TKC_TERMINAL_CMD}" -gt 200 ]; then TK_ERR='TERMINAL_CMD: at most 200 characters'; return 1; fi
   return 0
 }
 
@@ -189,7 +193,11 @@ tk_conf_text() {
     '# Seconds the VPS waits at the TOTP prompt (10-600).' \
     "OTP_READ_TIMEOUT=$TKC_OTP_READ_TIMEOUT" \
     '# Largest text that send accepts, in bytes (1-65536).' \
-    "SEND_MAX_BYTES=$TKC_SEND_MAX_BYTES"
+    "SEND_MAX_BYTES=$TKC_SEND_MAX_BYTES" \
+    '# Loopback port for tmuxkeep ui (1024-65535).' \
+    "DASHBOARD_PORT=$TKC_DASHBOARD_PORT" \
+    '# Program that opens a terminal for go and auth; empty picks the platform default.' \
+    "TERMINAL_CMD=$TKC_TERMINAL_CMD"
 }
 
 # tk_conf_write FILE: creates FILE's folder and writes tk_conf_text there; status 1 with TK_ERR on failure.
@@ -536,6 +544,22 @@ tk_check_agent_options() {
   [ "$bad" -eq 0 ]
 }
 
+# tk_install_dashboard REPO DEST: removes DEST and copies REPO/dashboard there without its test/
+# folder (spec 5.3). DEST must end in /tmuxkeep/dashboard, so a wrong argument cannot remove anything
+# else. Status 1 with TK_ERR set on any failure. cp -R SRC/. DEST/ works with BSD and GNU cp.
+tk_install_dashboard() {
+  local src=$1/dashboard dest=$2
+  TK_ERR=''
+  case $dest in
+    */tmuxkeep/dashboard) ;;
+    *) TK_ERR="refusing to replace $dest: the folder must be .../tmuxkeep/dashboard"; return 1 ;;
+  esac
+  if [ ! -f "$src/server.js" ]; then TK_ERR="missing $src/server.js"; return 1; fi
+  if ! rm -rf "$dest" || ! mkdir -p "$dest"; then TK_ERR="cannot create $dest"; return 1; fi
+  if ! cp -R "$src/." "$dest/" || ! rm -rf "$dest/test"; then TK_ERR="cannot copy the dashboard to $dest"; return 1; fi
+  return 0
+}
+
 # ---- the main sequence (spec 6.1 steps 0-9) ----
 
 # tk_deploy_remote REPO KEY STAGE HARDEN ROTATE UNLOCK: steps 4-8. Works inside $TK_PARENT.
@@ -567,7 +591,7 @@ tk_deploy_remote() {
     return 255
   fi
   if [ "$rc" -ne 0 ]; then printf 'deploy: tmuxkeep-setup failed with exit %s\n' "$rc" >&2; return "$rc"; fi
-  # 7. The wrapper, the completion and the rc block.
+  # 7. The wrapper, the completion, the dashboard and the rc block.
   if ! mkdir -p "$HOME/.local/bin" "$HOME/.tmuxkeep"; then
     printf 'deploy: cannot install into %s\n' "$HOME" >&2; return 1
   fi
@@ -576,6 +600,9 @@ tk_deploy_remote() {
   fi
   if ! cp "$repo/laptop/completion.bash" "$HOME/.tmuxkeep/completion.bash" || ! chmod 0644 "$HOME/.tmuxkeep/completion.bash"; then
     printf 'deploy: cannot install %s\n' "$HOME/.tmuxkeep/completion.bash" >&2; return 1
+  fi
+  if ! tk_install_dashboard "$repo" "$HOME/.local/share/tmuxkeep/dashboard"; then
+    printf 'deploy: %s\n' "$TK_ERR" >&2; return 1
   fi
   rcfile=$(tk_rc_file)
   if ! tk_set_block "$rcfile" "$(tk_rc_block)"; then printf 'deploy: %s\n' "$TK_ERR" >&2; return 1; fi
@@ -669,6 +696,7 @@ tk_deploy_main() {
   trap - INT TERM HUP
   if [ "$rc" -eq 0 ]; then
     rcfile=$(tk_rc_file)
+    printf 'dashboard: installed at %s (run: tmuxkeep ui)\n' "$HOME/.local/share/tmuxkeep/dashboard" >&2
     printf 'deploy: done. Open a new terminal, or run: . %s\n' "$rcfile" >&2
   fi
   return "$rc"

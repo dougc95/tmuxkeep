@@ -154,8 +154,8 @@ function Get-TmuxkeepAdminHelp {
 # The same rules are implemented by the bash broker (parse_conf), the installer (read_deploy_conf)
 # and the bash deploy: keep the four in step.
 
-# The sixteen laptop keys in file order. One line on purpose: the parity test reads it.
-function Get-TmuxkeepConfigKeys { @('HOST', 'PORT', 'USER', 'KEY', 'ADMIN_KEY', 'LAUNCH_CMD', 'RESUME_CMD', 'INSTALL_CLAUDE_CODE', 'LEASE_SECS', 'TOMBSTONE_TTL', 'OTP_FAIL_MAX', 'OTP_FAIL_WINDOW', 'OTP_COOLDOWN', 'OTP_HARD_MAX', 'OTP_READ_TIMEOUT', 'SEND_MAX_BYTES') }
+# The eighteen laptop keys in file order. One line on purpose: the parity test reads it.
+function Get-TmuxkeepConfigKeys { @('HOST', 'PORT', 'USER', 'KEY', 'ADMIN_KEY', 'LAUNCH_CMD', 'RESUME_CMD', 'INSTALL_CLAUDE_CODE', 'LEASE_SECS', 'TOMBSTONE_TTL', 'OTP_FAIL_MAX', 'OTP_FAIL_WINDOW', 'OTP_COOLDOWN', 'OTP_HARD_MAX', 'OTP_READ_TIMEOUT', 'SEND_MAX_BYTES', 'DASHBOARD_PORT', 'TERMINAL_CMD') }
 
 # A new ordered dictionary with every key at its default; HOST has none and stays empty.
 function Get-TmuxkeepConfigDefaults {
@@ -176,6 +176,8 @@ function Get-TmuxkeepConfigDefaults {
     $d['OTP_HARD_MAX'] = '10'
     $d['OTP_READ_TIMEOUT'] = '60'
     $d['SEND_MAX_BYTES'] = '8000'
+    $d['DASHBOARD_PORT'] = '7707'
+    $d['TERMINAL_CMD'] = ''
     return $d
 }
 
@@ -238,6 +240,10 @@ function Test-TmuxkeepConfigValues {
     Assert-TmuxkeepInt -Key 'OTP_HARD_MAX' -Value ([string]$Values['OTP_HARD_MAX']) -Lo $failMax -Hi 100
     Assert-TmuxkeepInt -Key 'OTP_READ_TIMEOUT' -Value ([string]$Values['OTP_READ_TIMEOUT']) -Lo 10 -Hi 600
     Assert-TmuxkeepInt -Key 'SEND_MAX_BYTES' -Value ([string]$Values['SEND_MAX_BYTES']) -Lo 1 -Hi 65536
+    Assert-TmuxkeepInt -Key 'DASHBOARD_PORT' -Value ([string]$Values['DASHBOARD_PORT']) -Lo 1024 -Hi 65535
+    if (([string]$Values['TERMINAL_CMD']).Length -gt 200) {
+        throw 'TERMINAL_CMD: at most 200 characters'
+    }
 }
 
 # Strict reader (spec 4.1, G30): never evaluates the file. Returns the ordered dictionary, or
@@ -325,6 +331,8 @@ function ConvertTo-TmuxkeepConfigText {
         OTP_HARD_MAX = 'Wrong codes since the last good one that lock the gate until root clears it (OTP_FAIL_MAX-100).'
         OTP_READ_TIMEOUT = 'Seconds the VPS waits at the TOTP prompt (10-600).'
         SEND_MAX_BYTES = 'Largest text that send accepts, in bytes (1-65536).'
+        DASHBOARD_PORT = 'Loopback port for tmuxkeep ui (1024-65535).'
+        TERMINAL_CMD = 'Program that opens a terminal for go and auth; empty picks the platform default.'
     }
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append("# tmuxkeep laptop configuration, written by the deploy script. Edit it by hand if you like:`n")
@@ -567,6 +575,31 @@ function Set-TmuxkeepProfileSnippet {
     Set-TmuxkeepMarkedBlock -Path $ProfilePath -Lines $lines
 }
 
+# The dashboard (spec 5.3): Destination is removed and made again from <RepoRoot>\dashboard, without
+# its test folder. Destination must end in \tmuxkeep-dashboard, so a wrong argument cannot remove
+# anything else.
+function Install-TmuxkeepDashboard {
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Destination
+    )
+    $src = Join-Path $RepoRoot 'dashboard'
+    if (-not (Test-Path -LiteralPath (Join-Path $src 'server.js') -PathType Leaf)) {
+        throw ('missing ' + (Join-Path $src 'server.js'))
+    }
+    if ((Split-Path -Leaf $Destination) -cne 'tmuxkeep-dashboard') {
+        throw "refusing to replace ${Destination}: the folder must be named tmuxkeep-dashboard"
+    }
+    if (Test-Path -LiteralPath $Destination) {
+        Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction Stop
+    }
+    Copy-Item -LiteralPath $src -Destination $Destination -Recurse -ErrorAction Stop
+    $tests = Join-Path $Destination 'test'
+    if (Test-Path -LiteralPath $tests) {
+        Remove-Item -LiteralPath $tests -Recurse -Force -ErrorAction Stop
+    }
+}
+
 # Dot-sourced (the tests): functions only.
 if ($MyInvocation.InvocationName -eq '.') { return }
 
@@ -678,11 +711,13 @@ try {
         exit $setupExit
     }
 
-    # 7. The wrapper and the profile snippet.
+    # 7. The wrapper, the dashboard next to it, and the profile snippet.
     try {
         $scriptsDir = Join-Path $HomeDir 'scripts'
         [void][IO.Directory]::CreateDirectory($scriptsDir)
         Copy-Item -LiteralPath (Join-Path $repo 'laptop\tmuxkeep.ps1') -Destination (Join-Path $scriptsDir 'tmuxkeep.ps1') -Force
+        $dashboardDir = Join-Path $scriptsDir 'tmuxkeep-dashboard'
+        Install-TmuxkeepDashboard -RepoRoot $repo -Destination $dashboardDir
         Set-TmuxkeepProfileSnippet -ProfilePath $ProfilePath -SnippetPath (Join-Path $repo 'laptop\profile-snippet.ps1')
     }
     catch { Write-Host ('deploy: ' + $_.Exception.Message); exit 1 }
@@ -695,4 +730,5 @@ finally {
     # 9. Remove the local staging folder.
     Remove-Item -LiteralPath $parent -Recurse -Force -ErrorAction SilentlyContinue
 }
+Write-Host "dashboard: installed at $dashboardDir (run: tmuxkeep ui)"
 Write-Host 'deploy: done. Open a new PowerShell window to load the tmuxkeep function.'
