@@ -93,7 +93,7 @@ tk_smoke_main() {
   tk_step '3/14 ls (live row)' 0 "^${TK_N}[[:space:]]+live" ls
 
   # 4. The dashboard's status: one JSON object that names the session. PASS only after that check.
-  TK_OUT=$("$TK_WRAPPER" status 2>&1)
+  TK_OUT=$("$TK_WRAPPER" status)
   code=$?
   if [ "$code" = 0 ] && ! tk_names_session "$TK_OUT"; then
     tk_stop '4/14 status (JSON naming the session)' "the status output does not name $TK_N" "$TK_OUT"

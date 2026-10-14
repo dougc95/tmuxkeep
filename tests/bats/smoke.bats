@@ -6,7 +6,7 @@ setup() {
   laptop_setup
   export TK_FAKE_DIR="$BATS_TEST_TMPDIR/fake"
   mkdir -p "$TK_FAKE_DIR"
-  unset TK_FAKE_IGNORE_LOCK TK_FAKE_RM_NOW_LOCKED TK_FAKE_STATUS_EMPTY TK_FAKE_STATUS_BAD TK_SMOKE_JQ
+  unset TK_FAKE_IGNORE_LOCK TK_FAKE_RM_NOW_LOCKED TK_FAKE_STATUS_EMPTY TK_FAKE_STATUS_BAD TK_FAKE_STATUS_STDERR TK_SMOKE_JQ
   SMOKE="$REPO/tests/smoke.sh"
   FAKE="$BATS_TEST_TMPDIR/fake-tmuxkeep"
   cat > "$FAKE" <<'EOF'
@@ -41,7 +41,8 @@ case $verb in
       echo tombstone > "$dir/state"
       echo "tombstoned $name; still running, reaped after 24h; restore with: tmuxkeep restore $name"; exit 0 ;;
   restore) echo live > "$dir/state"; echo "restored $name"; exit 0 ;;
-  status) if [ -n "${TK_FAKE_STATUS_BAD:-}" ]; then printf '{"sessions":[{"name":"%s"}\n' "$n"; exit 0; fi
+  status) if [ -n "${TK_FAKE_STATUS_STDERR:-}" ]; then echo 'warning: a stderr line that is not JSON' >&2; fi
+          if [ -n "${TK_FAKE_STATUS_BAD:-}" ]; then printf '{"sessions":[{"name":"%s"}\n' "$n"; exit 0; fi
           if [ "$state" = live ] && [ -z "${TK_FAKE_STATUS_EMPTY:-}" ]; then
             printf '{"version":"x","sessions":[{"name":"%s","state":"live"}]}\n' "$n"
           else
@@ -139,6 +140,23 @@ calls() { cat "$TK_FAKE_DIR/calls.log"; }
   [[ "$output" == *'FAIL 4/14 status (JSON naming the session): the status output does not name smoke-'* ]]
   [ "$(printf '%s\n' "$output" | grep -c 'To clean it up')" -eq 1 ]
   [ "$(calls | tail -n 1)" = status ]
+  # The same failure without jq: the fixed-string fallback must reject a status that lacks the name.
+  export TK_FAKE_DIR="$BATS_TEST_TMPDIR/fake2"
+  mkdir -p "$TK_FAKE_DIR"
+  export TK_SMOKE_JQ=no-such-jq-program
+  run "$BASH" "$SMOKE" --wrapper "$FAKE"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'FAIL 4/14 status (JSON naming the session): the status output does not name smoke-'* ]]
+  [ "$(printf '%s\n' "$output" | grep -c 'To clean it up')" -eq 1 ]
+  [ "$(calls | tail -n 1)" = status ]
+}
+
+@test "step 4 reads stdout only: a stderr line on a successful status does not fail it" {
+  export TK_FAKE_STATUS_STDERR=1
+  run "$BASH" "$SMOKE" --wrapper "$FAKE"
+  [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+  [[ "$output" == *'PASS 4/14 status (JSON naming the session)'* ]]
+  [[ "$output" == *'smoke: all steps passed'* ]]
 }
 
 @test "step 4 rejects output that is not JSON when jq is installed, and matches the name as text without jq" {
