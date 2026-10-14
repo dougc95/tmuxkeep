@@ -127,3 +127,15 @@ teardown() { teardown_remote; }
   [ "$status" -eq 2 ]
   [ "$stderr" = "tmuxkeep: text longer than 3 bytes" ]
 }
+
+@test "remote: status is not gated, writes no audit line, and reports the lease of this key id and client IP" {
+  rtm new-session -d -s api
+  printf '%s\n' "$(date +%s)" > /home/claude/.tmuxkeep/leases/laptop@203.0.113.9
+  run remote 203.0.113.9 laptop status
+  [ "$status" -eq 0 ]
+  jq -e '.lease_secs_left > 1790 and .lease_secs_left <= 1800 and ([.sessions[].name] == ["api"]) and .user == "claude"' <<<"$output"
+  run remote 198.51.100.7 laptop "$(b64cmd status --lines 0)"
+  [ "$status" -eq 0 ]
+  jq -e '.lease_secs_left == 0 and .lines == 0 and .sessions[0].lines == []' <<<"$output"
+  [ ! -s /var/log/tmuxkeep/audit.log ]
+}

@@ -110,6 +110,11 @@ Describe 'profile snippet' {
             ($r.CompletionMatches.CompletionText -join ',') | Should -BeExactly 'rename,restore,resume'
         }
 
+        It 'completes status for the first word' {
+            $r = TabExpansion2 -inputScript 'tmuxkeep st' -cursorColumn 11
+            ($r.CompletionMatches.CompletionText -join ',') | Should -BeExactly 'status'
+        }
+
         It 'completes cached session names after go' {
             Set-Content -LiteralPath (Join-Path $env:TEMP 'tmuxkeep-names.txt') -Value @('api', 'web') -Encoding ascii
             $r = TabExpansion2 -inputScript 'tmuxkeep go a' -cursorColumn 13

@@ -69,7 +69,7 @@ deploy_conf_keys_fixture() { sed -n 's/^\([A-Z_]*\)=.*/\1/p' "$REPO/tests/fixtur
 
 @test "the completer verb lists match the broker's verbs (reap excluded) and each other" {
   local want b p s
-  want='auth go lock log ls new peek rename restore resume rm send unlock'
+  want='auth go lock log ls new peek rename restore resume rm send status unlock'
   b=$(broker_verbs | sorted_words)
   [ "$b" = "$want" ] || { echo "broker verb_ functions: $b"; return 1; }
   p=$(ps_verbs); one_line 'PowerShell completer verbs' "$p"
