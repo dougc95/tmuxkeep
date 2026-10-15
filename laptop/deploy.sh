@@ -546,15 +546,25 @@ tk_check_agent_options() {
 
 # tk_install_dashboard REPO DEST: removes DEST and copies REPO/dashboard there without its test/
 # folder (spec 5.3). DEST must end in /tmuxkeep/dashboard, so a wrong argument cannot remove anything
-# else. Status 1 with TK_ERR set on any failure. cp -R SRC/. DEST/ works with BSD and GNU cp.
+# else, and it must be neither a symbolic link nor the same physical folder as the source (a link in
+# the path above it can make it so): nothing is removed in those cases. Status 1 with TK_ERR set on
+# any failure. cp -R SRC/. DEST/ works with BSD and GNU cp.
 tk_install_dashboard() {
-  local src=$1/dashboard dest=$2
+  local src=$1/dashboard dest=$2 src_phys dest_phys
   TK_ERR=''
   case $dest in
     */tmuxkeep/dashboard) ;;
     *) TK_ERR="refusing to replace $dest: the folder must be .../tmuxkeep/dashboard"; return 1 ;;
   esac
   if [ ! -f "$src/server.js" ]; then TK_ERR="missing $src/server.js"; return 1; fi
+  if [ -L "$dest" ]; then TK_ERR="refusing to replace $dest: it is a symbolic link"; return 1; fi
+  if [ -d "$dest" ]; then
+    src_phys=$(cd -P "$src" && pwd)
+    dest_phys=$(cd -P "$dest" && pwd)
+    if [ -n "$dest_phys" ] && [ "$dest_phys" = "$src_phys" ]; then
+      TK_ERR="refusing to replace $dest: it is the same folder as the source $src"; return 1
+    fi
+  fi
   if ! rm -rf "$dest" || ! mkdir -p "$dest"; then TK_ERR="cannot create $dest"; return 1; fi
   if ! cp -R "$src/." "$dest/" || ! rm -rf "$dest/test"; then TK_ERR="cannot copy the dashboard to $dest"; return 1; fi
   return 0

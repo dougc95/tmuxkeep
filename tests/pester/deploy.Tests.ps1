@@ -164,6 +164,11 @@ Describe 'Install-TmuxkeepDashboard' {
             [Array]::Sort($names, [StringComparer]::Ordinal)
             return ($names -join ',')
         }
+        # Removes a junction or symbolic link itself, never what it points at (and does nothing for anything else).
+        function Remove-LinkOnly([string]$Path) {
+            $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+            if ($null -ne $item -and $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { [IO.Directory]::Delete($Path) }
+        }
     }
 
     It 'copies dashboard\ without test\ into a new folder under a path with spaces (Review Focus 2)' {
@@ -186,7 +191,96 @@ Describe 'Install-TmuxkeepDashboard' {
         Set-Content -LiteralPath (Join-Path $other 'keep.txt') -Value 'keep' -Encoding ascii
         { Install-TmuxkeepDashboard -RepoRoot $DashRepo -Destination $other } | Should -Throw -ExpectedMessage "refusing to replace ${other}: the folder must be named tmuxkeep-dashboard"
         Test-Path -LiteralPath (Join-Path $other 'keep.txt') | Should -BeTrue
-        { Install-TmuxkeepDashboard -RepoRoot (Join-Path $TestDrive 'empty') -Destination (Join-Path $TestDrive 'x\tmuxkeep-dashboard') } | Should -Throw -ExpectedMessage '*dashboard\server.js'
+    }
+
+    # Final review L148: a refusal happens before anything is removed, so a destination that exists
+    # survives a repository without the dashboard.
+    It 'leaves an existing destination alone when the repository has no dashboard' {
+        $dest = Join-Path $TestDrive 'x\tmuxkeep-dashboard'
+        New-Item -ItemType Directory -Path $dest -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $dest 'keep.txt') -Value 'keep' -Encoding ascii
+        { Install-TmuxkeepDashboard -RepoRoot (Join-Path $TestDrive 'empty') -Destination $dest } | Should -Throw -ExpectedMessage '*dashboard\server.js'
+        Test-Path -LiteralPath (Join-Path $dest 'keep.txt') | Should -BeTrue
+        Get-Content -LiteralPath (Join-Path $dest 'keep.txt') | Should -BeExactly 'keep'
+    }
+
+    # A junction is a reparse point: Remove-Item -Recurse on it can reach the files of its target in
+    # Windows PowerShell 5.1, so the folder behind a link is never touched. New-Item -ItemType Junction
+    # needs no administrator rights.
+    It 'refuses a destination that is a junction, and its target stays intact' {
+        $target = Join-Path $TestDrive 'junction target'
+        New-Item -ItemType Directory -Path (Join-Path $target 'sub') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $target 'keep.txt') -Value 'keep' -Encoding ascii
+        Set-Content -LiteralPath (Join-Path $target 'sub\deep.txt') -Value 'deep' -Encoding ascii
+        $dest = Join-Path $TestDrive 'jn\scripts\tmuxkeep-dashboard'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
+        New-Item -ItemType Junction -Path $dest -Target $target | Out-Null
+        try {
+            { Install-TmuxkeepDashboard -RepoRoot $DashRepo -Destination $dest } | Should -Throw -ExpectedMessage "refusing to replace ${dest}: it is a junction or symbolic link"
+            Get-Content -LiteralPath (Join-Path $target 'keep.txt') | Should -BeExactly 'keep'
+            Get-Content -LiteralPath (Join-Path $target 'sub\deep.txt') | Should -BeExactly 'deep'
+            Test-Path -LiteralPath (Join-Path $target 'server.js') | Should -BeFalse
+            (Get-Item -LiteralPath $dest -Force).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) | Should -BeTrue
+        }
+        finally {
+            Remove-LinkOnly $dest
+        }
+    }
+
+    It 'refuses a destination that is a junction to a folder that is gone' {
+        $target = Join-Path $TestDrive 'vanished target'
+        New-Item -ItemType Directory -Path $target | Out-Null
+        $dest = Join-Path $TestDrive 'jn2\scripts\tmuxkeep-dashboard'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
+        New-Item -ItemType Junction -Path $dest -Target $target | Out-Null
+        Remove-Item -LiteralPath $target -Recurse -Force
+        try {
+            { Install-TmuxkeepDashboard -RepoRoot $DashRepo -Destination $dest } | Should -Throw -ExpectedMessage "refusing to replace ${dest}: it is a junction or symbolic link"
+            (Get-Item -LiteralPath $dest -Force).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) | Should -BeTrue
+        }
+        finally {
+            Remove-LinkOnly $dest
+        }
+    }
+
+    # The destination and the source dashboard\ folder are one physical folder here: the repository's
+    # dashboard is a junction to the destination folder. Removing the destination would remove the source.
+    It 'refuses a destination that is the same folder as the source, and the folder stays intact' {
+        $real = Join-Path $TestDrive 'same\real\tmuxkeep-dashboard'
+        New-Item -ItemType Directory -Path $real -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $real 'server.js') -Value '// server' -Encoding ascii
+        Set-Content -LiteralPath (Join-Path $real 'keep.txt') -Value 'keep' -Encoding ascii
+        $linkedRepo = Join-Path $TestDrive 'same\linked repo'
+        New-Item -ItemType Directory -Path $linkedRepo -Force | Out-Null
+        New-Item -ItemType Junction -Path (Join-Path $linkedRepo 'dashboard') -Target $real | Out-Null
+        try {
+            { Install-TmuxkeepDashboard -RepoRoot $linkedRepo -Destination $real } | Should -Throw -ExpectedMessage "refusing to replace ${real}: it is the same folder as the source *"
+            Get-Content -LiteralPath (Join-Path $real 'keep.txt') | Should -BeExactly 'keep'
+            Test-Path -LiteralPath (Join-Path $real 'server.js') | Should -BeTrue
+        }
+        finally {
+            Remove-LinkOnly (Join-Path $linkedRepo 'dashboard')
+        }
+        # The same path spelled another way (case, ..\, a trailing separator) is the same folder too.
+        $spelled = (Join-Path $TestDrive 'same\real\..\REAL\tmuxkeep-dashboard') + '\'
+        $plainRepo = Join-Path $TestDrive 'same\plain repo'
+        New-Item -ItemType Directory -Path $plainRepo -Force | Out-Null
+        New-Item -ItemType Junction -Path (Join-Path $plainRepo 'dashboard') -Target $real | Out-Null
+        try {
+            { Install-TmuxkeepDashboard -RepoRoot $plainRepo -Destination $spelled } | Should -Throw -ExpectedMessage '*it is the same folder as the source *'
+            Get-Content -LiteralPath (Join-Path $real 'keep.txt') | Should -BeExactly 'keep'
+        }
+        finally {
+            Remove-LinkOnly (Join-Path $plainRepo 'dashboard')
+        }
+    }
+
+    It 'still replaces an ordinary existing folder, which is not a link and not the source' {
+        $dest = Join-Path $TestDrive 'ordinary\tmuxkeep-dashboard'
+        New-Item -ItemType Directory -Path $dest -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $dest 'stale.js') -Value 'old' -Encoding ascii
+        Install-TmuxkeepDashboard -RepoRoot $DashRepo -Destination $dest
+        Get-Tree $dest | Should -BeExactly 'lib/a.js,public/app.js,server.js'
     }
 }
 

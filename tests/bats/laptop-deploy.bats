@@ -413,3 +413,88 @@ $MSG_KEYCHAIN" ]
   [ "$output" = "refusing to replace $BATS_TEST_TMPDIR/precious: the folder must be .../tmuxkeep/dashboard" ]
   [ -f "$BATS_TEST_TMPDIR/precious/keep.txt" ]
 }
+
+# install_dashboard REPO DEST: runs tk_install_dashboard in a child shell; prints TK_ERR and exits 1 on failure.
+install_dashboard() {
+  run "$BASH" -c '. "$1"; tk_install_dashboard "$2" "$3" || { printf "%s\n" "$TK_ERR"; exit 1; }' _ "$R/laptop/deploy.sh" "$1" "$2"
+}
+
+# Final review L148: the destination is removed with rm -rf, so a link or the source folder itself must
+# never reach it.
+@test "tk_install_dashboard refuses a symlink destination and leaves what it points at alone" {
+  local base="$BATS_TEST_TMPDIR/share/tmuxkeep" target="$BATS_TEST_TMPDIR/linked target"
+  mkdir -p "$base" "$target/sub"
+  printf 'keep\n' > "$target/keep.txt"
+  printf 'deep\n' > "$target/sub/deep.txt"
+  ln -s "$target" "$base/dashboard"
+  install_dashboard "$R" "$base/dashboard"
+  [ "$status" -eq 1 ]
+  [ "$output" = "refusing to replace $base/dashboard: it is a symbolic link" ]
+  [ -L "$base/dashboard" ]
+  [ "$(cat "$target/keep.txt")" = keep ]
+  [ "$(cat "$target/sub/deep.txt")" = deep ]
+  [ ! -e "$target/server.js" ]
+  # A link whose target is gone is still a link: refused, not replaced.
+  rm -rf "$target"
+  install_dashboard "$R" "$base/dashboard"
+  [ "$status" -eq 1 ]
+  [ "$output" = "refusing to replace $base/dashboard: it is a symbolic link" ]
+  [ -L "$base/dashboard" ]
+}
+
+@test "tk_install_dashboard refuses a destination that is the same folder as the source, whichever side holds the link" {
+  local share="$BATS_TEST_TMPDIR/share"
+  # The folder above the destination is a link to the repository: dest resolves to REPO/dashboard.
+  mkdir -p "$share"
+  ln -s "$R" "$share/tmuxkeep"
+  install_dashboard "$R" "$share/tmuxkeep/dashboard"
+  [ "$status" -eq 1 ]
+  [ "$output" = "refusing to replace $share/tmuxkeep/dashboard: it is the same folder as the source $R/dashboard" ]
+  [ -f "$R/dashboard/server.js" ]
+  [ -f "$R/dashboard/public/app.js" ]
+  # The source holds the link: REPO2/dashboard points at the real destination folder.
+  local real="$BATS_TEST_TMPDIR/real/tmuxkeep/dashboard" repo2="$BATS_TEST_TMPDIR/repo2"
+  mkdir -p "$real" "$repo2"
+  printf '// server\n' > "$real/server.js"
+  printf 'keep\n' > "$real/keep.txt"
+  ln -s "$real" "$repo2/dashboard"
+  install_dashboard "$repo2" "$real"
+  [ "$status" -eq 1 ]
+  [ "$output" = "refusing to replace $real: it is the same folder as the source $repo2/dashboard" ]
+  [ "$(cat "$real/keep.txt")" = keep ]
+  [ -f "$real/server.js" ]
+}
+
+@test "tk_install_dashboard with no dashboard in the repository leaves an existing destination alone" {
+  local dest="$BATS_TEST_TMPDIR/share/tmuxkeep/dashboard" empty="$BATS_TEST_TMPDIR/empty-repo"
+  mkdir -p "$dest" "$empty"
+  printf 'keep\n' > "$dest/keep.txt"
+  install_dashboard "$empty" "$dest"
+  [ "$status" -eq 1 ]
+  [ "$output" = "missing $empty/dashboard/server.js" ]
+  [ "$(cat "$dest/keep.txt")" = keep ]
+}
+
+@test "tk_install_dashboard still replaces an ordinary existing folder" {
+  local dest="$BATS_TEST_TMPDIR/share/tmuxkeep/dashboard"
+  mkdir -p "$dest"
+  printf 'old\n' > "$dest/stale.js"
+  install_dashboard "$R" "$dest"
+  [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+  [ ! -e "$dest/stale.js" ]
+  cmp "$dest/server.js" "$R/dashboard/server.js"
+  [ ! -e "$dest/test" ]
+}
+
+@test "deploy stops with deploy: and exit 1 when the dashboard folder is a symlink, and leaves its target alone" {
+  local target="$BATS_TEST_TMPDIR/linked target"
+  mkdir -p "$target" "$HOME/.local/share/tmuxkeep"
+  printf 'keep\n' > "$target/keep.txt"
+  ln -s "$target" "$HOME/.local/share/tmuxkeep/dashboard"
+  run --separate-stderr deploy
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"deploy: refusing to replace $HOME/.local/share/tmuxkeep/dashboard: it is a symbolic link"* ]]
+  [[ "$stderr" != *'dashboard: installed'* ]]
+  [ -L "$HOME/.local/share/tmuxkeep/dashboard" ]
+  [ "$(cat "$target/keep.txt")" = keep ]
+}

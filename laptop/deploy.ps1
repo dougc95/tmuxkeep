@@ -575,9 +575,26 @@ function Set-TmuxkeepProfileSnippet {
     Set-TmuxkeepMarkedBlock -Path $ProfilePath -Lines $lines
 }
 
+# Resolve-TmuxkeepFolder: the full path of a folder, without a trailing separator, with a junction or
+# symbolic link replaced by the folder it points at (one level), so that two spellings of one
+# folder compare equal. Case is left alone; callers compare without regard to case.
+function Resolve-TmuxkeepFolder {
+    param([Parameter(Mandatory)][string]$Path)
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $item = Get-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue
+    if ($null -ne $item -and $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) -and $item.Target) {
+        $link = [string]@($item.Target)[0]
+        if (-not [IO.Path]::IsPathRooted($link)) { $link = Join-Path (Split-Path -Parent $full) $link }
+        $full = [IO.Path]::GetFullPath($link).TrimEnd('\')
+    }
+    return $full
+}
+
 # The dashboard (spec 5.3): Destination is removed and made again from <RepoRoot>\dashboard, without
 # its test folder. Destination must end in \tmuxkeep-dashboard, so a wrong argument cannot remove
-# anything else.
+# anything else, and it must be neither a junction or symbolic link (Remove-Item -Recurse can reach
+# the files behind one in Windows PowerShell 5.1) nor the same folder as the source: nothing is
+# removed in those cases.
 function Install-TmuxkeepDashboard {
     param(
         [Parameter(Mandatory)][string]$RepoRoot,
@@ -590,7 +607,14 @@ function Install-TmuxkeepDashboard {
     if ((Split-Path -Leaf $Destination) -cne 'tmuxkeep-dashboard') {
         throw "refusing to replace ${Destination}: the folder must be named tmuxkeep-dashboard"
     }
-    if (Test-Path -LiteralPath $Destination) {
+    $existing = Get-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+    if ($null -ne $existing) {
+        if ($existing.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) {
+            throw "refusing to replace ${Destination}: it is a junction or symbolic link"
+        }
+        if ([string]::Equals((Resolve-TmuxkeepFolder -Path $Destination), (Resolve-TmuxkeepFolder -Path $src), [StringComparison]::OrdinalIgnoreCase)) {
+            throw "refusing to replace ${Destination}: it is the same folder as the source $src"
+        }
         Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction Stop
     }
     Copy-Item -LiteralPath $src -Destination $Destination -Recurse -ErrorAction Stop
