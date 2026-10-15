@@ -251,8 +251,37 @@ follow_lines() {
 }
 
 @test "status --follow given twice is a usage error, audited" {
-  run --separate-stderr tmuxkeep status --follow --follow
+  # timeout bounds it: a regression that accepted the duplicate flag would stream for ever.
+  run --separate-stderr timeout 30 bash "$TMUXKEEP_BIN" --key t status --follow --follow </dev/null
+  [ "$status" -ne 124 ] || { echo "status --follow --follow was still streaming after 30 s"; return 1; }
   [ "$status" -eq 2 ]
   [ "$stderr" = 'tmuxkeep: usage: tmuxkeep status [--follow] [--lines N]' ]
   [ "$(audit_field ok)" = false ]
+}
+
+@test "status --follow stops with exit 1 when sleep fails, instead of spinning" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  printf '#!/bin/sh\nexit 1\n' > "$BATS_TEST_TMPDIR/bin/sleep"
+  chmod +x "$BATS_TEST_TMPDIR/bin/sleep"
+  run timeout 30 env PATH="$BATS_TEST_TMPDIR/bin:$PATH" bash -c 'bash "$1" --key t status --follow </dev/null | head -n 5; echo "broker=${PIPESTATUS[0]}"' _ "$TMUXKEEP_BIN"
+  [ "$status" -eq 0 ]
+  [ "${#lines[@]}" -eq 2 ] || { printf '%s\n' "${lines[@]}" | cut -c1-80; return 1; }
+  [ "${lines[1]}" = 'broker=1' ]
+}
+
+@test "otp_scan and otp_cooldown_left read their NOW argument as decimal, leading zeros included" {
+  export LC_ALL=C.UTF-8
+  source "$TMUXKEEP_BIN"
+  OTP_FAIL_MAX=3 OTP_FAIL_WINDOW=600 OTP_COOLDOWN=300
+  printf '%s\n' 1000000 1000000 1000000 > "$BATS_TEST_TMPDIR/fails"
+  otp_scan "$BATS_TEST_TMPDIR/fails" 01000010
+  [ "$OTP_COUNT" -eq 3 ]
+  [ "$OTP_NEWEST" -eq 1000000 ]
+  otp_cooldown_left 01000100
+  [ "$COOLDOWN_LEFT" -eq 200 ]
+  # 8 and 9 are not octal digits: the unguarded arithmetic stops with an error instead.
+  otp_scan "$BATS_TEST_TMPDIR/fails" 01000009
+  [ "$OTP_COUNT" -eq 3 ]
+  otp_cooldown_left 01000009
+  [ "$COOLDOWN_LEFT" -eq 291 ]
 }

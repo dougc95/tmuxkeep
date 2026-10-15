@@ -32,6 +32,17 @@ teardown() { teardown_remote; }
   [ "$(wc -l < /var/log/tmuxkeep/audit.log)" -eq 1 ]
 }
 
+@test "remote: TMUXKEEP_GATE_WAIT is ignored, the gate lock wait keeps its default bound" {
+  flock /home/claude/.tmuxkeep/gate.lock sleep 20 3>&- &
+  local holder=$!
+  _poll 5 bash -c "! flock -n /home/claude/.tmuxkeep/gate.lock true"
+  # With the override honoured the call would be refused (3) after 1 s; ignored, it is still waiting at 5 s.
+  run env SSH_ORIGINAL_COMMAND='unlock api' SSH_CLIENT='203.0.113.9 50000 22' TMUXKEEP_GATE_WAIT=1 \
+    timeout 5 bash "$TMUXKEEP_BIN" --key laptop </dev/null
+  { pkill -P "$holder" || :; kill "$holder" || :; } 2>/dev/null
+  [ "$status" -eq 124 ]
+}
+
 @test "remote: reap is refused (2) and audited" {
   run --separate-stderr remote 203.0.113.9 laptop reap
   [ "$status" -eq 2 ]

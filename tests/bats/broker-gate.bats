@@ -6,7 +6,11 @@ setup() {
   mk_session api
   tm set-option -t '=api:' @tmuxkeep_locked 1
 }
-teardown() { teardown_local; }
+# HOLDER is the pid of a background flock that holds gate.lock (a test sets it); it sleeps at most 40 s.
+teardown() {
+  if [ -n "${HOLDER:-}" ]; then { pkill -P "$HOLDER" || :; kill "$HOLDER" || :; } 2>/dev/null; fi
+  teardown_local
+}
 
 fails_file() { printf '%s' "$TMUXKEEP_HOME/otp-fails"; }
 
@@ -197,6 +201,54 @@ fails_file() { printf '%s' "$TMUXKEEP_HOME/otp-fails"; }
   wait
   [ "$status" -eq 0 ]
   [ $(( (t1 - t0) / 1000000 )) -ge 1400 ]
+}
+
+# hold_gate_lock SECONDS: a background flock holds gate.lock for that long (40 s at most); returns
+# once it really holds it. teardown kills it.
+hold_gate_lock() {
+  flock "$TMUXKEEP_HOME/gate.lock" sleep "$1" 3>&- &
+  HOLDER=$!
+  _poll 5 bash -c "! flock -n '$TMUXKEEP_HOME/gate.lock' true"
+}
+
+@test "a gated call without a terminal stops waiting for the gate lock: exit 3, the message, gate-busy audited" {
+  mk_lease t -
+  hold_gate_lock 40
+  export TMUXKEEP_GATE_WAIT=2
+  local t0 t1
+  t0=$(date +%s)
+  run --separate-stderr timeout 40 bash "$TMUXKEEP_BIN" --key t unlock api </dev/null
+  t1=$(date +%s)
+  [ "$status" -eq 3 ] || { echo "exit $status after $((t1 - t0))s: $stderr"; return 1; }
+  [ "$stderr" = 'tmuxkeep: the gate is busy (a TOTP code is being typed); try again' ]
+  [ "$((t1 - t0))" -ge 1 ]
+  [ "$((t1 - t0))" -le 25 ]
+  [ "$(audit_count)" -eq 1 ]
+  [ "$(audit_field ok)" = false ]
+  [ "$(audit_field detail)" = gate-busy ]
+  [ "$(audit_field verb)" = unlock ]
+  # Nothing ran: the session is still locked.
+  [ "$(locked_flag api)" = 1 ]
+}
+
+@test "the bound is 20 seconds by default and TMUXKEEP_GATE_WAIT takes digits only" {
+  [ "$(grep -c '^GATE_WAIT=20$' "$TMUXKEEP_BIN")" -eq 1 ]
+  [ "$(grep -c 'flock -w "\$GATE_WAIT" -E 77 9' "$TMUXKEEP_BIN")" -eq 1 ]
+  mk_lease t -
+  hold_gate_lock 3
+  export TMUXKEEP_GATE_WAIT=1x
+  # A value that is not digits is ignored, so the default 20 s bound applies and the 3 s holder is outwaited.
+  run --separate-stderr timeout 40 bash "$TMUXKEEP_BIN" --key t unlock api </dev/null
+  [ "$status" -eq 0 ] || { echo "exit $status: $stderr"; return 1; }
+  [ "$output" = 'unlocked api' ]
+}
+
+@test "a caller with a terminal keeps waiting for the gate lock without a bound" {
+  hold_gate_lock 3
+  export TMUXKEEP_GATE_WAIT=1
+  run with_tty "$(code_for_step "$(now_step)")" --key t auth
+  [ "$status" -eq 0 ] || { echo "exit $status: $output"; return 1; }
+  [[ "$(strip_cr "$output")" == *"authenticated; lease valid for 30m"* ]]
 }
 
 @test "unlock: missing session (5), tombstone name (2), already unlocked is fine (0)" {
