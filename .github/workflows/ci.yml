@@ -1,5 +1,5 @@
 # CI for tmuxkeep (spec 9.6): bats and shellcheck in Docker on Linux, Pester under Windows
-# PowerShell 5.1, and the laptop suites under macOS /bin/bash 3.2.
+# PowerShell 5.1, the laptop suites under macOS /bin/bash 3.2, and the dashboard's Node suite.
 name: ci
 
 on:
@@ -55,3 +55,20 @@ jobs:
       - name: shellcheck the laptop files
         run: |
           shellcheck --shell=bash -S warning laptop/tmuxkeep.sh laptop/deploy.sh laptop/completion.bash tests/bats/laptop-helpers.bash tests/bats/stubs/ssh tests/bats/stubs/scp tests/bats/stubs/ssh-keygen tests/smoke.sh tests/run-bats.sh
+
+  dashboard:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run the dashboard tests (node:test, built-in modules only, no packages)
+        run: |
+          node --version
+          node --test "dashboard/test/*.test.js"
