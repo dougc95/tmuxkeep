@@ -36,9 +36,12 @@ typed into a real terminal, and the audit log keeps its meaning.
   input (section 7).
 - **D18 `auth --end`.** The broker gains a way to end the caller's lease early, so the
   exposure window after using the dashboard can be closed with one click.
-- **D19 Unaudited reads, audited connections.** One-shot `status` writes no audit line
-  (like `ls --names`). `status --follow` writes exactly one line when the stream starts,
-  none per snapshot, so a stolen key cannot watch sessions without leaving a trace.
+- **D19 Audited reads, one line per connection.** One-shot `status` writes one audit line
+  (`detail: lines=N`), like `peek`. `status --follow` writes exactly one line when the
+  stream starts, none per snapshot, so a stolen key cannot read pane output without
+  leaving a trace. (Amended 2026-10-14 during execution: the first version left one-shot
+  `status` unaudited, which let a key holder read the tail of every pane with no trace,
+  less than `peek` already guarantees; the dashboard itself only uses `--follow`.)
 
 ## 3. Components and files
 
@@ -75,7 +78,8 @@ fixtures, `tests/smoke.sh`/`tests/smoke.ps1` (one `status` call), `.github/workf
   for `ls --names`, and the usage path turns it back on).
 - `--lines N`: 0-40, default 12. Options in any order; anything else is a usage error:
   `usage: tmuxkeep status [--follow] [--lines N]`.
-- One-shot: prints exactly one JSON object on one line and exits 0. No audit line.
+- One-shot: prints exactly one JSON object on one line, writes one audit line
+  (`verb: status`, `ok: true`, `detail: lines=N`) and exits 0 (amended D19).
 - `--follow`: re-enables auditing for one write and writes one audit line first
   (`verb: status`, `ok: true`, `detail: follow lines=N`; a failed write prints the usual
   `audit write failed` warning and the stream still runs), then prints one JSON object
@@ -302,8 +306,9 @@ Every spawn is an argv array with `shell: false`. `TMUXKEEP_TERMINAL_DRYRUN=1` m
   lease allows, including `send` into a shell, which is command execution as `USER`.
   That is the same ceiling as a compromised laptop today and lasts until the lease ends.
   **End lease** closes it; a shorter `LEASE_SECS` narrows it.
-- What stays unaudited: one-shot `status`. Every `status --follow` connection leaves one
-  audit line. `auth --end` is audited.
+- Every one-shot `status` call leaves one audit line and every `status --follow`
+  connection leaves one audit line (none per snapshot). `auth --end` is audited. Only
+  `ls --names` and `ls --tombstones` (names only, no pane output) stay unaudited.
 - The token appears in browser history and on screen; it changes on every `tmuxkeep ui`.
 - The local server logs nothing to disk.
 
