@@ -58,7 +58,8 @@ tk_ui() {
   node "$dir/server.js" "$@"
 }
 
-# tk_main WORD...: the wrapper; returns ssh's exit code, or 2 for a local usage error.
+# tk_main WORD...: the wrapper; returns ssh's exit code, or 2 for a local usage error. The one local
+# verb, ui (tk_ui), is never sent: it returns node's exit code (2 when node or the dashboard is missing).
 tk_main() {
   local w text answer has_now=0 has_confirm=0 rc
   local -a words

@@ -125,7 +125,8 @@ try {
     $script:SessionMayExist = $false
 
     # 14. The audit log must show every verb we used, against this session, and the status call of
-    # step 4 (status is audited like peek, amended D19; its line has no session name). This step does
+    # step 4 (status is audited like peek, amended D19; its line has no session name, ok true and
+    # detail lines=12, the default). This step does
     # its own check (instead of Invoke-Step) so that PASS is printed only after the audit lines are verified.
     $logStep = '14/14 log -n 20 (audit lines for this session)'
     $logWords = @('log', '-n', '20')
@@ -144,9 +145,11 @@ try {
         if ($missing.Count -gt 0) {
             Stop-Smoke -Step $logStep -Reason ('no audit line for session ' + $n + ' and verb: ' + ($missing -join ', ')) -Output $script:LastOut
         }
-        $statusHits = @($lines | Where-Object { $_.Contains('"verb":"status"') -and $_.Contains('"session":""') })
+        $statusHits = @($lines | Where-Object {
+            $_.Contains('"verb":"status"') -and $_.Contains('"session":""') -and $_.Contains('"ok":true') -and $_.Contains('"detail":"lines=12"')
+        })
         if ($statusHits.Count -eq 0) {
-            Stop-Smoke -Step $logStep -Reason 'no audit line with verb status and no session (status is audited, one line per call)' -Output $script:LastOut
+            Stop-Smoke -Step $logStep -Reason 'no audit line with verb status, no session, ok true and detail lines=12 (status is audited, one line per call)' -Output $script:LastOut
         }
     }
     Confirm-Step -Step $logStep -Code $logCode -ExpectCode 0 -Output $script:LastOut

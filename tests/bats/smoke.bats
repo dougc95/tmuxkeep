@@ -54,6 +54,15 @@ case $verb in
          s=''
          case $c in *' '*) s=${c#* }; s=${s%% *} ;; esac
          if [ "$v" = status ] && [ -n "${TK_FAKE_STATUS_UNAUDITED:-}" ]; then continue; fi
+         if [ "$v" = status ]; then
+           # What the broker writes for a one-shot status: ok true, detail lines=N (12 unless told otherwise).
+           ok=true
+           detail='lines=12'
+           if [ "${TK_FAKE_STATUS_AUDIT:-}" = failed ]; then ok=false; fi
+           if [ "${TK_FAKE_STATUS_AUDIT:-}" = other ]; then detail='lines=5'; fi
+           printf '{"verb":"status","session":"","ok":%s,"detail":"%s"}\n' "$ok" "$detail"
+           continue
+         fi
          printf '{"verb":"%s","session":"%s"}\n' "$v" "$s"
        done < "$dir/calls.log"
        exit 0 ;;
@@ -164,8 +173,29 @@ calls() { cat "$TK_FAKE_DIR/calls.log"; }
   export TK_FAKE_STATUS_UNAUDITED=1
   run "$BASH" "$SMOKE" --wrapper "$FAKE"
   [ "$status" -eq 1 ]
-  [[ "$output" == *'FAIL 14/14 log -n 20 (audit lines for this session): no audit line with verb status and no session'* ]]
+  [[ "$output" == *'FAIL 14/14 log -n 20 (audit lines for this session): no audit line with verb status, no session, ok true and detail lines=12'* ]]
   [[ "$output" != *'smoke: all steps passed'* ]]
+}
+
+# Final review L180: the status line must be a successful one with the default 12 lines, not just any line.
+@test "step 14 fails when the status audit line is a failure, or has another detail than lines=12" {
+  local mode
+  for mode in failed other; do
+    export TK_FAKE_STATUS_AUDIT=$mode
+    export TK_FAKE_DIR="$BATS_TEST_TMPDIR/fake-$mode"
+    mkdir -p "$TK_FAKE_DIR"
+    run "$BASH" "$SMOKE" --wrapper "$FAKE"
+    [ "$status" -eq 1 ] || { echo "$mode: $output"; return 1; }
+    [[ "$output" == *'FAIL 14/14 log -n 20 (audit lines for this session): no audit line with verb status, no session, ok true and detail lines=12'* ]]
+    [[ "$output" != *'smoke: all steps passed'* ]]
+  done
+}
+
+@test "step 14 passes on a status audit line with ok true and detail lines=12" {
+  run "$BASH" "$SMOKE" --wrapper "$FAKE"
+  [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+  [[ "$output" == *'PASS 14/14 log -n 20 (audit lines for this session)'* ]]
+  [[ "$output" == *'smoke: all steps passed'* ]]
 }
 
 @test "step 4 rejects output that is not JSON when jq is installed, and matches the name as text without jq" {

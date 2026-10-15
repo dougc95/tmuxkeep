@@ -3,7 +3,8 @@
 # Usage:  & "$HOME\scripts\tmuxkeep.ps1" <words...>      (the profile function passes @args)
 # Every word is base64-encoded (UTF-8) and sent as: ssh tmuxkeep b64 <token>...
 # The VPS side is a forced command, so quoting never reaches a remote shell.
-# Exit code: ssh's own, or 2 for a local usage error.
+# Exit code: ssh's own, or 2 for a local usage error. The one local verb, ui, is never sent: it runs
+# the dashboard server with node and returns node's exit code (2 when node or the dashboard is missing).
 #
 # Windows PowerShell 5.1 notes (each one was verified; keep this file as it is):
 #  - No param block and no CmdletBinding attribute at the top of this script.

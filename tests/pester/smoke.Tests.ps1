@@ -43,6 +43,13 @@ switch -CaseSensitive ($verb) {
     'log'     { foreach ($c in Get-Content -LiteralPath (Join-Path $dir 'calls.log')) {
                     $w = $c -split ' '
                     if ($env:TMUXKEEP_FAKE_STATUS_UNAUDITED -and $w[0] -ceq 'status') { continue }
+                    if ($w[0] -ceq 'status') {
+                        # What the broker writes for a one-shot status: ok true, detail lines=N (12 unless told otherwise).
+                        $ok = if ($env:TMUXKEEP_FAKE_STATUS_AUDIT -ceq 'failed') { 'false' } else { 'true' }
+                        $detail = if ($env:TMUXKEEP_FAKE_STATUS_AUDIT -ceq 'other') { 'lines=5' } else { 'lines=12' }
+                        '{{"verb":"status","session":"","ok":{0},"detail":"{1}"}}' -f $ok, $detail
+                        continue
+                    }
                     '{{"verb":"{0}","session":"{1}"}}' -f $w[0], $(if ($w.Count -gt 1) { $w[1] } else { '' })
                 }
                 exit 0 }
@@ -59,6 +66,7 @@ switch -CaseSensitive ($verb) {
         Remove-Item Env:\TMUXKEEP_FAKE_STATUS_EMPTY -ErrorAction SilentlyContinue
         Remove-Item Env:\TMUXKEEP_FAKE_STATUS_BAD -ErrorAction SilentlyContinue
         Remove-Item Env:\TMUXKEEP_FAKE_STATUS_UNAUDITED -ErrorAction SilentlyContinue
+        Remove-Item Env:\TMUXKEEP_FAKE_STATUS_AUDIT -ErrorAction SilentlyContinue
     }
 
     AfterAll {
@@ -68,6 +76,7 @@ switch -CaseSensitive ($verb) {
         Remove-Item Env:\TMUXKEEP_FAKE_STATUS_EMPTY -ErrorAction SilentlyContinue
         Remove-Item Env:\TMUXKEEP_FAKE_STATUS_BAD -ErrorAction SilentlyContinue
         Remove-Item Env:\TMUXKEEP_FAKE_STATUS_UNAUDITED -ErrorAction SilentlyContinue
+        Remove-Item Env:\TMUXKEEP_FAKE_STATUS_AUDIT -ErrorAction SilentlyContinue
     }
 
     It 'passes against a broker that behaves' {
@@ -122,8 +131,24 @@ switch -CaseSensitive ($verb) {
         $env:TMUXKEEP_FAKE_STATUS_UNAUDITED = '1'
         $out = & $Smoke -Wrapper $Fake *>&1 | Out-String -Width 4096
         $LASTEXITCODE | Should -Be 1
-        $out | Should -Match 'FAIL 14/14 log -n 20 \(audit lines for this session\): no audit line with verb status and no session'
+        $out | Should -Match 'FAIL 14/14 log -n 20 \(audit lines for this session\): no audit line with verb status, no session, ok true and detail lines=12'
         $out | Should -Not -Match 'smoke: all steps passed'
+    }
+
+    # Final review L180: the status line must be a successful one with the default 12 lines, not just any line.
+    It 'step 14 fails when the status audit line is a failure, or has another detail than lines=12' -ForEach @('failed', 'other') {
+        $env:TMUXKEEP_FAKE_STATUS_AUDIT = $_
+        $out = & $Smoke -Wrapper $Fake *>&1 | Out-String -Width 4096
+        $LASTEXITCODE | Should -Be 1
+        $out | Should -Match 'FAIL 14/14 log -n 20 \(audit lines for this session\): no audit line with verb status, no session, ok true and detail lines=12'
+        $out | Should -Not -Match 'smoke: all steps passed'
+    }
+
+    It 'step 14 passes on a status audit line with ok true and detail lines=12' {
+        $out = & $Smoke -Wrapper $Fake *>&1 | Out-String -Width 4096
+        $LASTEXITCODE | Should -Be 0
+        $out | Should -Match 'PASS 14/14 log -n 20'
+        $out | Should -Match 'smoke: all steps passed'
     }
 
     It 'step 4 fails when the status output is not JSON' {

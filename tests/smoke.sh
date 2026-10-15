@@ -10,8 +10,9 @@
 # lifecycle (14 steps) and removes it again. Exit 0 when every step passes, 1 at the first mismatch:
 # the script stops there and prints how to clean up by hand. The same hint is printed if the run is
 # interrupted while a session may exist. Step 1 (auth) runs uncaptured so the "TOTP: " prompt
-# reaches the terminal; every other step is captured, and the gated verbs reuse the lease. Step 4
-# checks the dashboard's status JSON with jq when jq is installed, else with a fixed-string match.
+# reaches the terminal; step 4 captures stdout only and lets stderr through to the terminal; every
+# other step is captured (stdout and stderr), and the gated verbs reuse the lease. Step 4 checks the
+# dashboard's status JSON with jq when jq is installed, else with a fixed-string match.
 
 TK_WRAPPER=$HOME/.local/bin/tmuxkeep
 TK_N=''
@@ -113,7 +114,8 @@ tk_smoke_main() {
   TK_SESSION_MAY_EXIST=0
 
   # 14. The audit log must show every verb used against this session, and the status call of step 4
-  # (status is audited like peek, amended D19; its line has no session name). PASS only after that check.
+  # (status is audited like peek, amended D19; its line has no session name, ok true and detail
+  # lines=12, the default). PASS only after that check.
   TK_OUT=$("$TK_WRAPPER" log -n 20 2>&1)
   code=$?
   if [ "$code" = 0 ]; then
@@ -123,8 +125,8 @@ tk_smoke_main() {
     if [ -n "$missing" ]; then
       tk_stop '14/14 log -n 20 (audit lines for this session)' "no audit line for session $TK_N and verb:$missing" "$TK_OUT"
     fi
-    if ! printf '%s\n' "$TK_OUT" | grep -F '"verb":"status"' | grep -qF '"session":""'; then
-      tk_stop '14/14 log -n 20 (audit lines for this session)' 'no audit line with verb status and no session (status is audited, one line per call)' "$TK_OUT"
+    if ! printf '%s\n' "$TK_OUT" | grep -F '"verb":"status"' | grep -F '"session":""' | grep -F '"ok":true' | grep -qF '"detail":"lines=12"'; then
+      tk_stop '14/14 log -n 20 (audit lines for this session)' 'no audit line with verb status, no session, ok true and detail lines=12 (status is audited, one line per call)' "$TK_OUT"
     fi
   fi
   tk_check '14/14 log -n 20 (audit lines for this session)' "$code" 0 "$TK_OUT" ''
