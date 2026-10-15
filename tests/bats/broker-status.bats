@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# status (dashboard spec 4.1): the JSON snapshot, its bounds and its silence in the audit log.
+# status (dashboard spec 4.1): the JSON snapshot, its bounds and its one audit line (amended D19).
 load helpers
 setup() { setup_local; }
 teardown() { teardown_local; }
@@ -12,11 +12,15 @@ status_of() {
   jq -e . >/dev/null <<<"$output"
 }
 
-@test "status with no tmux server: one JSON line with no sessions, exit 0, no audit line, no server started" {
+@test "status with no tmux server: one JSON line with no sessions, exit 0, one audit line, no server started" {
   status_of
   [ "$output" = "{\"version\":\"dev\",\"now\":\"$(date -u -d "@$FIXED_NOW" +%Y-%m-%dT%H:%M:%SZ)\",\"user\":\"claude\",\"lease_secs_left\":0,\"lease_secs\":1800,\"otp\":{\"locked\":false,\"fails\":0,\"cooldown_secs_left\":0},\"lines\":12,\"sessions\":[]}" ]
   [ -z "$stderr" ]
-  [ "$(audit_count)" -eq 0 ]
+  [ "$(audit_count)" -eq 1 ]
+  [ "$(audit_field verb)" = status ]
+  [ "$(audit_field ok)" = true ]
+  [ "$(audit_field session)" = '' ]
+  [ "$(audit_field detail)" = 'lines=12' ]
   [ ! -e "$TMUXKEEP_TMUX_SOCKET" ]
   [ ! -e "$TMUXKEEP_HOME/gate.lock" ]
 }
@@ -61,9 +65,11 @@ status_of() {
 
 @test "status --lines takes 0 to 40; anything else is a usage error, and usage errors are audited" {
   status_of --lines 40
+  [ "$(audit_field detail)" = 'lines=40' ]
   status_of --lines 007
   [ "$(jq .lines <<<"$output")" = 7 ]
-  [ "$(audit_count)" -eq 0 ]
+  [ "$(audit_field detail)" = 'lines=7' ]
+  [ "$(audit_count)" -eq 2 ]
   local line
   local -a args
   while IFS= read -r line; do
@@ -84,9 +90,29 @@ EOF
   [ "$stderr" = 'tmuxkeep: --lines must be 0-40' ]
   run --separate-stderr tmuxkeep status --frob
   [ "$stderr" = 'tmuxkeep: usage: tmuxkeep status [--follow] [--lines N]' ]
-  [ "$(audit_count)" -eq 10 ]
+  [ "$(audit_count)" -eq 12 ]
   [ "$(audit_field verb)" = status ]
   [ "$(audit_field ok)" = false ]
+}
+
+# Amended D19: a one-shot status returns the tail of every pane, so it leaves the same trace as peek.
+@test "one-shot status writes one audit line per call: verb status, ok true, no session, detail lines=N, no pane text" {
+  mk_session_cmd api 'echo secret-pane-text; exec sleep 300'
+  wait_for_pane_line api secret-pane-text
+  status_of --lines 5
+  [ "$(audit_count)" -eq 1 ]
+  [ "$(audit_field verb)" = status ]
+  [ "$(audit_field ok)" = true ]
+  [ "$(audit_field key)" = t ]
+  [ "$(audit_field session)" = '' ]
+  [ "$(audit_field detail)" = 'lines=5' ]
+  status_of
+  [ "$(audit_count)" -eq 2 ]
+  [ "$(audit_field detail)" = 'lines=12' ]
+  status_of --lines 0
+  [ "$(audit_count)" -eq 3 ]
+  [ "$(audit_field detail)" = 'lines=0' ]
+  [ "$(grep -c secret-pane-text "$TMUXKEEP_AUDIT")" -eq 0 ]
 }
 
 @test "status reports this key id's lease and the OTP state with the gate's own arithmetic" {
@@ -106,10 +132,13 @@ EOF
   [ "$(jq '.lease_secs_left' <<<"$output")" = 0 ]
 }
 
-@test "status works with an unwritable audit log, because it writes none" {
+@test "status with an unwritable audit log fails closed like every audited verb: exit 1, no snapshot" {
+  mk_session api
   export TMUXKEEP_AUDIT=/nonexistent-dir/audit.log
-  status_of
-  [ -z "$stderr" ]
+  run --separate-stderr tmuxkeep status
+  [ "$status" -eq 1 ]
+  [ "$stderr" = 'tmuxkeep: audit log not writable' ]
+  [ -z "$output" ]
 }
 
 # Review Focus 3: whatever a program prints, the snapshot stays one valid JSON line, or the dashboard
@@ -203,8 +232,18 @@ follow_lines() {
   [ "$(jq -r .now <<<"${lines[0]}")" != "$(jq -r .now <<<"${lines[1]}")" ]
 }
 
-@test "status --follow with an unwritable audit log warns once on stderr and still streams" {
+@test "status --follow with an unwritable audit log fails closed like every audited verb: exit 1, no snapshot" {
   export TMUXKEEP_AUDIT=/nonexistent-dir/audit.log
+  run --separate-stderr timeout 30 bash "$TMUXKEEP_BIN" --key t status --follow </dev/null
+  [ "$status" -eq 1 ] || { echo "exit $status"; return 1; }
+  [ "$stderr" = 'tmuxkeep: audit log not writable' ]
+  [ -z "$output" ]
+}
+
+# The pre-check passes (/dev/full opens for append) and the one write then fails, as in any verb: one
+# warning on stderr, and the stream goes on.
+@test "status --follow whose one audit write fails after the pre-check warns once on stderr and still streams" {
+  export TMUXKEEP_AUDIT=/dev/full
   run --separate-stderr follow_lines 2
   [ "$status" -eq 0 ]
   [ "${#lines[@]}" -eq 2 ]

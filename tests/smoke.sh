@@ -112,7 +112,8 @@ tk_smoke_main() {
   # The session is gone now; a later failure has nothing to clean up.
   TK_SESSION_MAY_EXIST=0
 
-  # 14. The audit log must show every verb used against this session. PASS only after that check.
+  # 14. The audit log must show every verb used against this session, and the status call of step 4
+  # (status is audited like peek, amended D19; its line has no session name). PASS only after that check.
   TK_OUT=$("$TK_WRAPPER" log -n 20 2>&1)
   code=$?
   if [ "$code" = 0 ]; then
@@ -121,6 +122,9 @@ tk_smoke_main() {
     done
     if [ -n "$missing" ]; then
       tk_stop '14/14 log -n 20 (audit lines for this session)' "no audit line for session $TK_N and verb:$missing" "$TK_OUT"
+    fi
+    if ! printf '%s\n' "$TK_OUT" | grep -F '"verb":"status"' | grep -qF '"session":""'; then
+      tk_stop '14/14 log -n 20 (audit lines for this session)' 'no audit line with verb status and no session (status is audited, one line per call)' "$TK_OUT"
     fi
   fi
   tk_check '14/14 log -n 20 (audit lines for this session)' "$code" 0 "$TK_OUT" ''

@@ -679,36 +679,37 @@ status_json() {
       '{version:$version,now:$now,user:$user,lease_secs_left:$left,lease_secs:$lease,otp:{locked:$locked,fails:$fails,cooldown_secs_left:$cool},lines:$lines,sessions:.}'
 }
 
-# status [--follow] [--lines N]: the dashboard's read (spec 4.1, D15, D19). Not gated. One-shot writes
-# no audit line (main turned auditing off); a usage error turns it back on, as in ls. --follow writes
-# one audit line, then one snapshot every 2 seconds, each with a fresh NOW, until stdout is gone: a
-# closed pipe ends it by SIGPIPE, or by the failed write when SIGPIPE is ignored.
+# status [--follow] [--lines N]: the dashboard's read (spec 4.1, D15, D19). Not gated. It returns the
+# tail of every pane, so it is audited like peek: one-shot writes one line (detail lines=N, N the
+# effective --lines) after the snapshot is printed; a usage error is audited too, as in every verb.
+# --follow writes one line (detail follow lines=N) when the connection starts, then turns auditing
+# off for the snapshots, one every 2 seconds each with a fresh NOW, until stdout is gone: a closed
+# pipe ends it by SIGPIPE, or by the failed write when SIGPIPE is ignored.
 verb_status() {
   local usage="usage: tmuxkeep status [--follow] [--lines N]"
   local follow=0 n=12 have_lines=0 json
   while (( $# > 0 )); do
     case $1 in
       --follow)
-        (( follow == 0 )) || { AUDIT_ENABLED=1; fail 2 "$usage"; }
+        (( follow == 0 )) || fail 2 "$usage"
         follow=1
         shift ;;
       --lines)
-        (( have_lines == 0 && $# >= 2 )) || { AUDIT_ENABLED=1; fail 2 "$usage"; }
+        (( have_lines == 0 && $# >= 2 )) || fail 2 "$usage"
         n=$2
         have_lines=1
         shift 2 ;;
-      *) AUDIT_ENABLED=1; fail 2 "$usage" ;;
+      *) fail 2 "$usage" ;;
     esac
   done
-  if ! [[ $n =~ ^[0-9]{1,4}$ ]] || (( 10#$n > 40 )); then AUDIT_ENABLED=1; fail 2 "--lines must be 0-40"; fi
+  if ! [[ $n =~ ^[0-9]{1,4}$ ]] || (( 10#$n > 40 )); then fail 2 "--lines must be 0-40"; fi
   n=$(( 10#$n ))
   authorize
   if (( ! follow )); then
     json=$(status_json "$n") || fail 1 "cannot build status"
     printf '%s\n' "$json"
-    exit 0
+    succeed "lines=$n"
   fi
-  AUDIT_ENABLED=1
   audit true "follow lines=$n"
   AUDIT_ENABLED=0
   while :; do
@@ -1164,8 +1165,6 @@ main() {
   if [[ $VERB == ls && ( ${ARGS[1]:-} == --names || ${ARGS[1]:-} == --tombstones ) ]]; then
     AUDIT_ENABLED=0
   fi
-  # status is an unaudited read (D19); its usage errors and --follow switch auditing back on.
-  if [[ $VERB == status ]]; then AUDIT_ENABLED=0; fi
 
   if (( AUDIT_ENABLED )); then
     if ! { : >> "$AUDIT_FILE"; } 2>/dev/null; then

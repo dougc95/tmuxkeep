@@ -42,6 +42,7 @@ switch -CaseSensitive ($verb) {
     'restore' { Set-Content -LiteralPath $stateFile -Value 'live' -Encoding ascii; "restored $name"; exit 0 }
     'log'     { foreach ($c in Get-Content -LiteralPath (Join-Path $dir 'calls.log')) {
                     $w = $c -split ' '
+                    if ($env:TMUXKEEP_FAKE_STATUS_UNAUDITED -and $w[0] -ceq 'status') { continue }
                     '{{"verb":"{0}","session":"{1}"}}' -f $w[0], $(if ($w.Count -gt 1) { $w[1] } else { '' })
                 }
                 exit 0 }
@@ -57,6 +58,7 @@ switch -CaseSensitive ($verb) {
         Remove-Item Env:\TMUXKEEP_FAKE_RM_NOW_LOCKED -ErrorAction SilentlyContinue
         Remove-Item Env:\TMUXKEEP_FAKE_STATUS_EMPTY -ErrorAction SilentlyContinue
         Remove-Item Env:\TMUXKEEP_FAKE_STATUS_BAD -ErrorAction SilentlyContinue
+        Remove-Item Env:\TMUXKEEP_FAKE_STATUS_UNAUDITED -ErrorAction SilentlyContinue
     }
 
     AfterAll {
@@ -65,6 +67,7 @@ switch -CaseSensitive ($verb) {
         Remove-Item Env:\TMUXKEEP_FAKE_RM_NOW_LOCKED -ErrorAction SilentlyContinue
         Remove-Item Env:\TMUXKEEP_FAKE_STATUS_EMPTY -ErrorAction SilentlyContinue
         Remove-Item Env:\TMUXKEEP_FAKE_STATUS_BAD -ErrorAction SilentlyContinue
+        Remove-Item Env:\TMUXKEEP_FAKE_STATUS_UNAUDITED -ErrorAction SilentlyContinue
     }
 
     It 'passes against a broker that behaves' {
@@ -113,6 +116,14 @@ switch -CaseSensitive ($verb) {
         [regex]::Matches($out, 'To clean it up').Count | Should -Be 1
         $calls = @(Get-Content -LiteralPath (Join-Path $env:TMUXKEEP_FAKE_DIR 'calls.log'))
         $calls[-1] | Should -BeExactly 'status'
+    }
+
+    It 'step 14 fails when the audit log has no status line, as with a broker that does not audit status' {
+        $env:TMUXKEEP_FAKE_STATUS_UNAUDITED = '1'
+        $out = & $Smoke -Wrapper $Fake *>&1 | Out-String -Width 4096
+        $LASTEXITCODE | Should -Be 1
+        $out | Should -Match 'FAIL 14/14 log -n 20 \(audit lines for this session\): no audit line with verb status and no session'
+        $out | Should -Not -Match 'smoke: all steps passed'
     }
 
     It 'step 4 fails when the status output is not JSON' {

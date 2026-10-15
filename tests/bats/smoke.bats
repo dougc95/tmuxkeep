@@ -6,7 +6,7 @@ setup() {
   laptop_setup
   export TK_FAKE_DIR="$BATS_TEST_TMPDIR/fake"
   mkdir -p "$TK_FAKE_DIR"
-  unset TK_FAKE_IGNORE_LOCK TK_FAKE_RM_NOW_LOCKED TK_FAKE_STATUS_EMPTY TK_FAKE_STATUS_BAD TK_FAKE_STATUS_STDERR TK_SMOKE_JQ
+  unset TK_FAKE_IGNORE_LOCK TK_FAKE_RM_NOW_LOCKED TK_FAKE_STATUS_EMPTY TK_FAKE_STATUS_BAD TK_FAKE_STATUS_STDERR TK_FAKE_STATUS_UNAUDITED TK_SMOKE_JQ
   SMOKE="$REPO/tests/smoke.sh"
   FAKE="$BATS_TEST_TMPDIR/fake-tmuxkeep"
   cat > "$FAKE" <<'EOF'
@@ -53,6 +53,7 @@ case $verb in
          v=${c%% *}
          s=''
          case $c in *' '*) s=${c#* }; s=${s%% *} ;; esac
+         if [ "$v" = status ] && [ -n "${TK_FAKE_STATUS_UNAUDITED:-}" ]; then continue; fi
          printf '{"verb":"%s","session":"%s"}\n' "$v" "$s"
        done < "$dir/calls.log"
        exit 0 ;;
@@ -157,6 +158,14 @@ calls() { cat "$TK_FAKE_DIR/calls.log"; }
   [ "$status" -eq 0 ] || { echo "$output"; return 1; }
   [[ "$output" == *'PASS 4/14 status (JSON naming the session)'* ]]
   [[ "$output" == *'smoke: all steps passed'* ]]
+}
+
+@test "step 14 fails when the audit log has no status line, as with a broker that does not audit status (amended D19)" {
+  export TK_FAKE_STATUS_UNAUDITED=1
+  run "$BASH" "$SMOKE" --wrapper "$FAKE"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'FAIL 14/14 log -n 20 (audit lines for this session): no audit line with verb status and no session'* ]]
+  [[ "$output" != *'smoke: all steps passed'* ]]
 }
 
 @test "step 4 rejects output that is not JSON when jq is installed, and matches the name as text without jq" {
