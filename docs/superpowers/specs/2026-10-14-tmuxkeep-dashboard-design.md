@@ -73,9 +73,10 @@ fixtures, `tests/smoke.sh`/`tests/smoke.ps1` (one `status` call), `.github/workf
 
 ### 4.1 `status [--follow] [--lines N]`
 
-- Not gated (not in `GATED_VERBS`); allowed remotely; usage errors exit 2 and are
-  audited like `ls` usage errors (main turns auditing off for `status` the way it does
-  for `ls --names`, and the usage path turns it back on).
+- Not gated (not in `GATED_VERBS`); allowed remotely; audited like every other verb
+  (amended D19): main's audit-log check applies, usage errors exit 2 with an audit line,
+  a one-shot call ends with one audit line, and `--follow` writes its one line and then
+  turns auditing off for the snapshots.
 - `--lines N`: 0-40, default 12. Options in any order; anything else is a usage error:
   `usage: tmuxkeep status [--follow] [--lines N]`.
 - One-shot: prints exactly one JSON object on one line, writes one audit line
