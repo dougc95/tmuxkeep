@@ -5,6 +5,8 @@ import { spawn } from 'node:child_process';
 import { sshArgs } from './protocol.js';
 
 export const ACTION_TIMEOUT_MS = 30000;
+// A clone can take minutes: new with --repo gets this one instead (spec 6.4).
+export const CLONE_TIMEOUT_MS = 300000;
 export const MAX_OUTPUT_CHARS = 2 * 1024 * 1024;
 
 // sshCommand(args, env): [program, argv] for the ssh argument list args.
@@ -31,9 +33,16 @@ function capped(text, chunk) {
   return chunk.length <= room ? text + chunk : text + chunk.slice(0, room);
 }
 
+// actionTimeoutMs(words): how long an action may run before it is stopped: CLONE_TIMEOUT_MS for new
+// whose words include --repo, ACTION_TIMEOUT_MS for every other action.
+export function actionTimeoutMs(words) {
+  return words[0] === 'new' && words.includes('--repo') ? CLONE_TIMEOUT_MS : ACTION_TIMEOUT_MS;
+}
+
 // runVerb(words, opts): resolves to {code, stdout, stderr, needs_auth}; never rejects. A run longer
-// than timeoutMs is killed and reported as code 124. A program that cannot be started is code 1.
-export function runVerb(words, { timeoutMs = ACTION_TIMEOUT_MS, env = process.env } = {}) {
+// than timeoutMs (actionTimeoutMs(words) unless given) is killed and reported as code 124; the VPS may
+// still finish the action, and the stderr line says so. A program that cannot be started is code 1.
+export function runVerb(words, { timeoutMs = actionTimeoutMs(words), env = process.env } = {}) {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
@@ -62,7 +71,7 @@ export function runVerb(words, { timeoutMs = ACTION_TIMEOUT_MS, env = process.en
       return;
     }
     child.on('close', (code) => {
-      if (timedOut) finish(124, `tmuxkeep ui: no answer within ${Math.round(timeoutMs / 1000)} seconds; ssh was stopped`);
+      if (timedOut) finish(124, `tmuxkeep ui: no answer within ${Math.round(timeoutMs / 1000)} seconds; ssh was stopped, but the VPS may still finish the action: check the page before you retry`);
       else finish(code === null ? 1 : code);
     });
     timer = setTimeout(() => {

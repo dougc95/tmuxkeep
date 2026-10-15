@@ -32,7 +32,8 @@ export function readConfig(file) {
     text = fs.readFileSync(file, 'latin1');
   } catch (err) {
     if (err.code === 'ENOENT') return { port: DEFAULT_PORT, terminalCmd: '' };
-    throw new Error(`config ${file}: cannot read`);
+    // The message stays as it is; the errno (EACCES, EISDIR...) is kept in the cause for whoever debugs it.
+    throw new Error(`config ${file}: cannot read`, { cause: err });
   }
   const found = {};
   const lines = text.split('\n');

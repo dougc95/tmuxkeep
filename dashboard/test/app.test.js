@@ -2,8 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {
-  actionOutcome, BANNER_AFTER_MS, bannerDue, clock, connectionView, createActions, errorText, HINT_255, humanise, lastLine, leaseLabel,
-  logEntries, PENDING_MS, pendingStep, planRows, POLL_TIMEOUT_MS, rowCells, splitSessions, STALL_MS, words,
+  actionOutcome, BANNER_AFTER_MS, bannerDue, clock, connectionView, createActions, errorText, fieldsUnchanged, HINT_255, humanise, lastLine,
+  leaseLabel, logEntries, LOG_DONE, MORE_DONE, newestTombstones, PENDING_MS, pendingStep, planRows, POLL_TIMEOUT_MS, rowCells, splitSessions,
+  STALL_MS, words,
 } from '../public/app.js';
 
 const APP = fs.readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
@@ -59,11 +60,37 @@ test('sessions split into live and tombstones, keeping tmux order', () => {
   assert.deepEqual(splitSessions(undefined), { live: [], tombstones: [] });
 });
 
+// Final review M3: the broker restores the NEWEST tombstone of a base name, whichever row was clicked, so
+// the page offers Restore on that row only.
+test('newestTombstones: the newest tombstone of each base name by epoch, compared as numbers', () => {
+  const t = (name) => ({ name, state: 'tombstone', tombstone_of: name.split('~')[1] });
+  const sessions = [
+    { name: 'api', state: 'live' }, t('zz~api~99'), t('zz~api~100'), t('zz~web~50'), t('zz~api~7'), { name: 'zz~odd', state: 'tombstone' },
+  ];
+  assert.deepEqual([...newestTombstones(sessions)].sort(), ['zz~api~100', 'zz~odd', 'zz~web~50']);
+  assert.deepEqual([...newestTombstones([t('zz~a~1'), t('zz~b~2')])].sort(), ['zz~a~1', 'zz~b~2']);
+  assert.deepEqual([...newestTombstones([])], []);
+  assert.deepEqual([...newestTombstones(undefined)], []);
+  // Only tombstones count: a live session never takes part, and one tombstone is its own newest.
+  assert.deepEqual([...newestTombstones([{ name: 'api', state: 'live' }, { name: 'web', state: 'locked' }])], []);
+  assert.deepEqual([...newestTombstones([t('zz~solo~5')])], ['zz~solo~5']);
+  // The broker sorts by epoch then by name and takes the last: equal epochs, the larger name wins.
+  assert.deepEqual([...newestTombstones([t('zz~a~007'), t('zz~a~7')])], ['zz~a~7']);
+  // Whatever the input order.
+  assert.deepEqual([...newestTombstones([t('zz~api~100'), t('zz~api~99')])], ['zz~api~100']);
+  assert.deepEqual([...newestTombstones([t('zz~api~99'), t('zz~api~100')])], ['zz~api~100']);
+});
+
 test('errors show the exit code and the last stderr line verbatim; 255 shows the wrapper hint', () => {
   assert.equal(errorText({ code: 3, stderr: 'tmuxkeep: session api is locked\n' }), 'exit 3: tmuxkeep: session api is locked');
   assert.equal(errorText({ code: 1, stderr: 'warning\r\ntmuxkeep: tmux: no server\n\n' }), 'exit 1: tmuxkeep: tmux: no server');
   assert.equal(errorText({ code: 5, stderr: '' }), 'exit 5: (no message)');
-  assert.equal(errorText({ code: 255, stderr: 'ssh: connect to host 203.0.113.10 port 22: Connection refused\n' }), `exit 255: ${HINT_255}`);
+  assert.equal(errorText({ code: 255, stderr: '' }), `exit 255: ${HINT_255}`);
+  assert.equal(errorText({ code: 255, stderr: '\n  \n' }), `exit 255: ${HINT_255}`);
+  assert.equal(errorText({ code: 255, stderr: 'ssh: connect to host 203.0.113.10 port 22: Connection refused\n' }),
+    `exit 255: ${HINT_255} (ssh: connect to host 203.0.113.10 port 22: Connection refused)`);
+  assert.equal(errorText({ code: 255, stderr: 'Warning: x\ntmuxkeep@203.0.113.10: Permission denied (publickey).\n' }),
+    `exit 255: ${HINT_255} (tmuxkeep@203.0.113.10: Permission denied (publickey).)`);
   assert.equal(HINT_255, "tmuxkeep: ssh to host 'tmuxkeep' failed (unreachable, key rejected, or remote killed by signal)");
   assert.equal(lastLine('a\nb\n'), 'b');
 });
@@ -327,6 +354,138 @@ test('any other action drops the pending one; so does expiry after 3 minutes', a
   await attach.actions.act(['send', 'api', 'x'], { onSuccess: attach.onSuccess });
   attach.actions.drop();
   assert.equal(attach.actions.pending(), null);
+});
+
+// Final review M4: a re-send that meets a 409 (another action still running) is not lost.
+test('a re-send that gets 409 re-arms the same pending action and is retried on a later tick', async () => {
+  const busy = { status: 409, data: { error: 'busy' } };
+  const r = rig([NEEDS_AUTH, busy, busy, OK('sent\n')]);
+  await r.actions.act(['send', 'api', 'x'], { onSuccess: r.onSuccess });
+  const armed = r.actions.pending();
+  assert.equal(armed.since, r.clockNow);
+  r.clockNow += 6000;
+  assert.equal(await r.actions.tick(withLease(r.clockNow - 500)), null, 'the first re-send is refused with 409');
+  assert.equal(r.calls.length, 2);
+  assert.deepEqual(r.notices.at(-1), ['another action is still running; the action that needed a code will be sent again in a moment', true]);
+  const rearmed = r.actions.pending();
+  assert.deepEqual(rearmed.words, ['send', 'api', 'x']);
+  assert.equal(rearmed.onSuccess, r.onSuccess, 'the same success handler');
+  assert.equal(rearmed.since, armed.since, 'the same since');
+  assert.deepEqual(r.success, []);
+  // The next tick tries again, meets 409 again, and re-arms again.
+  r.clockNow += 1000;
+  assert.equal(await r.actions.tick(withLease(r.clockNow - 500)), null);
+  assert.equal(r.calls.length, 3);
+  assert.equal(r.actions.pending().since, armed.since);
+  // Then the other action is over: the re-send runs, finishes like the first try would have, and is cleared.
+  r.clockNow += 1000;
+  await r.actions.tick(withLease(r.clockNow - 500));
+  assert.equal(r.calls.length, 4);
+  assert.deepEqual(r.calls[3], ['api/action', { words: ['send', 'api', 'x'] }]);
+  assert.deepEqual(r.success, ['sent\n']);
+  assert.equal(r.actions.pending(), null);
+  assert.equal(r.actions.tick(withLease(r.clockNow + 1000)), null, 'never re-sent twice');
+  assert.equal(r.calls.length, 4);
+  assert.deepEqual(r.terminals, [{ verb: 'auth' }], 'the terminal opened once');
+});
+
+test('a re-armed pending action still expires after 3 minutes, from the first refusal', async () => {
+  const r = rig([NEEDS_AUTH, { status: 409, data: { error: 'busy' } }]);
+  await r.actions.act(['send', 'api', 'x'], { onSuccess: r.onSuccess });
+  r.clockNow += 6000;
+  await r.actions.tick(withLease(r.clockNow - 500));
+  assert.notEqual(r.actions.pending(), null);
+  r.clockNow += PENDING_MS - 6000;
+  assert.equal(r.actions.tick(withLease(r.clockNow)), null);
+  assert.equal(r.actions.pending(), null);
+  assert.deepEqual(r.notices.at(-1), ['the action that needed a code was dropped after 3 minutes', true]);
+  assert.equal(r.calls.length, 2, 'no third call');
+  assert.deepEqual(r.success, []);
+});
+
+test('a re-armed pending action never re-sends after a second needs-auth, and another action drops it', async () => {
+  const second = rig([NEEDS_AUTH, { status: 409, data: { error: 'busy' } }, NEEDS_AUTH]);
+  await second.actions.act(['send', 'api', 'x'], { onSuccess: second.onSuccess });
+  second.clockNow += 3000;
+  await second.actions.tick(withLease(second.clockNow));
+  second.clockNow += 1000;
+  await second.actions.tick(withLease(second.clockNow));
+  assert.equal(second.calls.length, 3);
+  assert.equal(second.actions.pending(), null);
+  assert.deepEqual(second.terminals, [{ verb: 'auth' }], 'the terminal opens once');
+  assert.deepEqual(second.notices.at(-1), ['exit 4: tmuxkeep: authentication required', true]);
+  second.clockNow += 1000;
+  assert.equal(second.actions.tick(withLease(second.clockNow)), null);
+  assert.equal(second.calls.length, 3);
+
+  const other = rig([NEEDS_AUTH, { status: 409, data: { error: 'busy' } }, OK('listed\n')]);
+  await other.actions.act(['send', 'api', 'x'], { onSuccess: other.onSuccess });
+  other.clockNow += 3000;
+  await other.actions.tick(withLease(other.clockNow));
+  assert.notEqual(other.actions.pending(), null);
+  await other.actions.act(['log', '-n', '100']);
+  assert.equal(other.actions.pending(), null);
+  other.clockNow += 1000;
+  assert.equal(other.actions.tick(withLease(other.clockNow)), null);
+  assert.deepEqual(other.success, []);
+});
+
+test('a 409 on an ordinary action (not a re-send) keeps no pending action and says to try again', async () => {
+  const r = rig([{ status: 409, data: { error: 'busy' } }]);
+  assert.equal(await r.actions.act(['rename', 'api', 'web'], { onSuccess: r.onSuccess }), null);
+  assert.equal(r.actions.pending(), null);
+  assert.deepEqual(r.notices.at(-1), ['another action is still running; try again in a moment', true]);
+});
+
+// Final review L112: after More lines and Show log the notice is fixed text, not a raw pane or JSON line.
+test('success notices for More lines and Show log are fixed text; other verbs still show their last line', async () => {
+  assert.equal(MORE_DONE, 'showing the last 200 lines');
+  assert.equal(LOG_DONE, 'showing the last 100 audit lines');
+  const more = rig([OK('a pane line <b>\nanother\n')]);
+  await more.actions.act(words.more('api'), { onSuccess: more.onSuccess, done: MORE_DONE });
+  assert.deepEqual(more.notices.at(-1), [MORE_DONE, false]);
+  assert.deepEqual(more.success, ['a pane line <b>\nanother\n']);
+  const log = rig([OK('{"ts":"2026-10-14T10:00:00Z","detail":"x"}\n')]);
+  await log.actions.act(words.log(), { onSuccess: log.onSuccess, done: LOG_DONE });
+  assert.deepEqual(log.notices.at(-1), [LOG_DONE, false]);
+  const send = rig([OK('sent 13 bytes to api\n')]);
+  await send.actions.act(words.send('api', 'run the tests'));
+  assert.deepEqual(send.notices.at(-1), ['sent 13 bytes to api', false]);
+  const empty = rig([OK('')]);
+  await empty.actions.act(words.lock('api'));
+  assert.deepEqual(empty.notices.at(-1), ['done', false]);
+  // The fixed text survives a needs-auth round trip: the re-send ends with it too.
+  const again = rig([NEEDS_AUTH, OK('raw pane line\n')]);
+  await again.actions.act(words.more('api'), { onSuccess: again.onSuccess, done: MORE_DONE });
+  again.clockNow += 3000;
+  await again.actions.tick(withLease(again.clockNow));
+  assert.deepEqual(again.notices.at(-1), [MORE_DONE, false]);
+  assert.deepEqual(again.success, ['raw pane line\n']);
+});
+
+// Final review L118: the Rename and New success handlers clear a field only if it still holds what was
+// sent, as Send does, so a re-send that lands minutes later cannot wipe newer typing.
+test('fieldsUnchanged: true only while every field still holds what was sent (text compared trimmed)', () => {
+  assert.equal(fieldsUnchanged({ to: 'web' }, { to: 'web' }), true);
+  assert.equal(fieldsUnchanged({ to: 'web' }, { to: '  web ' }), true);
+  assert.equal(fieldsUnchanged({ to: 'web' }, { to: 'web2' }), false);
+  assert.equal(fieldsUnchanged({ to: 'web' }, { to: '' }), false);
+  const sent = { name: 'api', repo: '', cmd: 'claude', shell: false };
+  assert.equal(fieldsUnchanged(sent, { name: 'api', repo: '', cmd: 'claude', shell: false }), true);
+  assert.equal(fieldsUnchanged(sent, { name: ' api', repo: ' ', cmd: 'claude ', shell: false }), true);
+  assert.equal(fieldsUnchanged(sent, { name: 'api2', repo: '', cmd: 'claude', shell: false }), false);
+  assert.equal(fieldsUnchanged(sent, { name: 'api', repo: 'https://x', cmd: 'claude', shell: false }), false);
+  assert.equal(fieldsUnchanged(sent, { name: 'api', repo: '', cmd: 'claude --x', shell: false }), false);
+  assert.equal(fieldsUnchanged(sent, { name: 'api', repo: '', cmd: 'claude', shell: true }), false);
+  assert.equal(fieldsUnchanged({ name: 'api', shell: true }, { name: 'api', shell: true }), true);
+  assert.equal(fieldsUnchanged({}, { to: 'anything' }), true);
+});
+
+test('the page wires the guards: Rename and New use fieldsUnchanged, More and Log pass a fixed done text, Restore checks the newest', () => {
+  assert.equal((APP.match(/fieldsUnchanged\(/g) || []).length, 3, 'definition plus the Rename and New handlers');
+  assert.match(APP, /done: MORE_DONE/);
+  assert.match(APP, /done: LOG_DONE/);
+  assert.match(APP, /newestTombstones\(/);
 });
 
 test('the page has no leftover state field and polls with a timeout and a guard', () => {

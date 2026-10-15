@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { MAX_OUTPUT_CHARS, runVerb, sshCommand } from '../lib/ssh.js';
+import { ACTION_TIMEOUT_MS, CLONE_TIMEOUT_MS, MAX_OUTPUT_CHARS, actionTimeoutMs, runVerb, sshCommand } from '../lib/ssh.js';
 import { sshArgs } from '../lib/protocol.js';
 import { stubPlan, tempDir } from './helpers.js';
 
@@ -53,8 +53,59 @@ test('a run that outlives the timeout is killed and reported as 124', async () =
   const r = await runVerb(['peek', 'api'], { env: s.env, timeoutMs: 300 });
   assert.equal(r.code, 124);
   assert.equal(r.needs_auth, false);
-  assert.match(r.stderr, /no answer within 0 seconds; ssh was stopped\n$/);
+  assert.equal(r.stderr, 'tmuxkeep ui: no answer within 0 seconds; ssh was stopped, but the VPS may still finish the action: check the page before you retry\n');
   assert.ok(Date.now() - started < 5000);
+});
+
+// Final review I1a: the text names the timeout that was used (N), and does not tell the user to run the
+// verb again, because the VPS may still finish it.
+test('the 124 line names the timeout used and says the VPS may still finish the action', async () => {
+  const s = stubPlan({ peek: [{ steps: [{ hang: true }], code: 0 }] });
+  const r = await runVerb(['peek', 'api'], { env: s.env, timeoutMs: 2000 });
+  assert.equal(r.code, 124);
+  assert.equal(r.stderr,
+    'tmuxkeep ui: no answer within 2 seconds; ssh was stopped, but the VPS may still finish the action: check the page before you retry\n');
+  assert.ok(!/terminal/.test(r.stderr));
+});
+
+// Final review I1c: only a clone gets the long timeout.
+test('actionTimeoutMs: 300 s for new with --repo, 30 s for every other action', () => {
+  assert.equal(ACTION_TIMEOUT_MS, 30000);
+  assert.equal(CLONE_TIMEOUT_MS, 300000);
+  assert.equal(actionTimeoutMs(['new', 'api', '--repo', 'https://example.com/r.git']), 300000);
+  assert.equal(actionTimeoutMs(['new', 'api', '--cmd', 'x', '--repo', 'https://example.com/r.git', '--shell']), 300000);
+  assert.equal(actionTimeoutMs(['new', 'api']), 30000);
+  assert.equal(actionTimeoutMs(['new', 'api', '--shell']), 30000);
+  assert.equal(actionTimeoutMs(['send', 'api', '--repo']), 30000);
+  assert.equal(actionTimeoutMs(['resume', 'api', '--repo', 'x']), 30000);
+  assert.equal(actionTimeoutMs(['rm', 'api']), 30000);
+  assert.equal(actionTimeoutMs(['log', '-n', '100']), 30000);
+  assert.equal(actionTimeoutMs([]), 30000);
+});
+
+// runVerb really uses the chooser: the timer it arms is 300 s for a clone and 30 s otherwise. The timer
+// is replaced by a 50 ms one that records the delay it was asked for, so nothing waits.
+test('runVerb arms a 300 s timer for new with --repo and a 30 s timer for any other action', async () => {
+  const s = stubPlan({ '*': [{ steps: [{ hang: true }], code: 0 }] });
+  const realSetTimeout = globalThis.setTimeout;
+  const delays = [];
+  globalThis.setTimeout = (fn, ms, ...rest) => {
+    delays.push(ms);
+    return realSetTimeout(fn, 50, ...rest);
+  };
+  let clone;
+  let other;
+  try {
+    clone = await runVerb(['new', 'api', '--repo', 'https://example.com/r.git'], { env: s.env });
+    other = await runVerb(['peek', 'api'], { env: s.env });
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+  assert.deepEqual(delays, [300000, 30000]);
+  assert.match(clone.stderr, /^tmuxkeep ui: no answer within 300 seconds; /);
+  assert.match(other.stderr, /^tmuxkeep ui: no answer within 30 seconds; /);
+  assert.equal(clone.code, 124);
+  assert.equal(other.code, 124);
 });
 
 // Review Focus 4: ssh that cannot be started (missing, or a command line too long for Windows) is an

@@ -10,6 +10,10 @@ export const PENDING_MS = 180000;
 export const STALL_MS = 10000;
 export const POLL_TIMEOUT_MS = 3000;
 export const MORE_LINES = '200';
+// The success notices of More lines and Show log: fixed text, never the raw last line of a pane or an
+// audit entry.
+export const MORE_DONE = `showing the last ${MORE_LINES} lines`;
+export const LOG_DONE = 'showing the last 100 audit lines';
 export const HINT_255 = "tmuxkeep: ssh to host 'tmuxkeep' failed (unreachable, key rejected, or remote killed by signal)";
 
 // clock(secs): m:ss, or h:mm:ss from one hour on.
@@ -77,6 +81,27 @@ export function splitSessions(sessions) {
   return { live, tombstones };
 }
 
+// newestTombstones(sessions): the names of the tombstones that may offer Restore: for each base name
+// the one with the largest epoch (compared as a number; equal epochs: the larger name), which is the
+// one the broker restores whichever row was clicked. A tombstone whose name does not parse is kept.
+export function newestTombstones(sessions) {
+  const best = new Map();
+  const keep = new Set();
+  for (const s of Array.isArray(sessions) ? sessions : []) {
+    if (s.state !== 'tombstone') continue;
+    const m = /^zz~([a-z][a-z0-9_-]*)~([0-9]+)$/.exec(String(s.name));
+    if (!m) {
+      keep.add(s.name);
+      continue;
+    }
+    const epoch = BigInt(m[2]);
+    const cur = best.get(m[1]);
+    if (!cur || epoch > cur.epoch || (epoch === cur.epoch && s.name > cur.name)) best.set(m[1], { epoch, name: s.name });
+  }
+  for (const { name } of best.values()) keep.add(name);
+  return keep;
+}
+
 // rowCells(s): the six cell texts of a table row, in column order: name, state, attached marker, age,
 // idle, title. Every one is a string, ready for textContent.
 export function rowCells(s) {
@@ -112,10 +137,14 @@ export function lastLine(text) {
   return lines.length > 0 ? lines[lines.length - 1] : '';
 }
 
-// errorText(result): the banner for a non-zero action: the exit code and the broker's stderr line,
-// or for 255 the wrapper's hint.
+// errorText(result): the banner for a non-zero action: the exit code and the broker's stderr line, or
+// for 255 the wrapper's hint followed by ssh's own last stderr line in parentheses when there is one
+// (a rejected host key or key also exits 255).
 export function errorText(result) {
-  if (result.code === 255) return `exit 255: ${HINT_255}`;
+  if (result.code === 255) {
+    const why = lastLine(result.stderr);
+    return why ? `exit 255: ${HINT_255} (${why})` : `exit 255: ${HINT_255}`;
+  }
   return `exit ${result.code}: ${lastLine(result.stderr) || '(no message)'}`;
 }
 
@@ -167,6 +196,14 @@ export function logEntries(stdout) {
   });
 }
 
+// fieldsUnchanged takes what a request sent and what the fields hold now, and says whether every
+// field still holds what was sent: text compared after trimming (the requests send trimmed text),
+// checkboxes as they are. The Rename and New handlers clear their fields only then, as Send does, so a
+// re-send that lands minutes later cannot wipe what was typed since.
+export function fieldsUnchanged(sent, current) {
+  return Object.keys(sent).every((k) => (typeof sent[k] === 'string' ? String(current[k]).trim() === sent[k] : current[k] === sent[k]));
+}
+
 // actionOutcome(res, resend): what an answered action means: 'auth' (the lease is missing and this is
 // the first try, so keep the action and ask for a code), 'error' (any other non-zero code, which
 // includes a second refusal after a re-send), or 'ok'.
@@ -178,14 +215,18 @@ export function actionOutcome(res, resend) {
 // createActions({call, openTerminal, notice, now}): runs the verbs and owns the one pending action
 // of the needs-auth flow (spec 7). call(path, body) answers {status, data}; openTerminal(body)
 // answers true when the terminal opened; notice(text, isError) shows a line. No DOM in here.
-// act(words, {resend, onSuccess}) runs one verb; onSuccess(res) runs when it ends with code 0. A
-// refused action is kept together with its onSuccess, so the re-send finishes exactly like the first
-// try would have (clearing the box, selecting the new session). tick(state) is called after every
-// state poll and returns the promise of a re-send, or null.
+// act(words, {resend, onSuccess, done, since}) runs one verb; onSuccess(res) runs when it ends with
+// code 0, and done, when given, is the fixed success notice instead of the last stdout line. A refused
+// action is kept together with its onSuccess and done, so the re-send finishes exactly like the first
+// try would have (clearing the box, selecting the new session). A re-send that meets 409 (another
+// action still running) puts the same pending action back, with its first since, so a later tick
+// tries again; it still expires after PENDING_MS, and a second needs-auth is never re-sent. since is
+// only passed by tick. tick(state) is called after every state poll and returns the promise of a
+// re-send, or null.
 export function createActions({ call, openTerminal, notice, now = Date.now }) {
   let pending = null;
 
-  async function act(w, { resend = false, onSuccess = null } = {}) {
+  async function act(w, { resend = false, onSuccess = null, done = null, since = null } = {}) {
     if (!resend) pending = null;
     notice(`${w[0]}...`, false);
     let r;
@@ -196,7 +237,12 @@ export function createActions({ call, openTerminal, notice, now = Date.now }) {
       return null;
     }
     if (r.status === 409) {
-      notice('another action is still running; try again in a moment', true);
+      if (resend) {
+        pending = { words: w, since: since ?? now(), onSuccess, done };
+        notice('another action is still running; the action that needed a code will be sent again in a moment', true);
+      } else {
+        notice('another action is still running; try again in a moment', true);
+      }
       return null;
     }
     if (r.status !== 200 || !r.data) {
@@ -206,7 +252,7 @@ export function createActions({ call, openTerminal, notice, now = Date.now }) {
     const res = r.data;
     const outcome = actionOutcome(res, resend);
     if (outcome === 'auth') {
-      pending = { words: w, since: now(), onSuccess };
+      pending = { words: w, since: now(), onSuccess, done };
       if (await openTerminal({ verb: 'auth' })) notice('type the code in the terminal that opened', false);
       return res;
     }
@@ -214,7 +260,7 @@ export function createActions({ call, openTerminal, notice, now = Date.now }) {
       notice(errorText(res), true);
       return res;
     }
-    notice(lastLine(res.stdout) || 'done', false);
+    notice(done ?? (lastLine(res.stdout) || 'done'), false);
     if (onSuccess) onSuccess(res);
     return res;
   }
@@ -227,7 +273,7 @@ export function createActions({ call, openTerminal, notice, now = Date.now }) {
     } else if (step === 'resend') {
       const p = pending;
       pending = null;
-      return act(p.words, { resend: true, onSuccess: p.onSuccess });
+      return act(p.words, { resend: true, onSuccess: p.onSuccess, done: p.done, since: p.since });
     }
     return null;
   }
@@ -400,7 +446,9 @@ function start() {
     setText($('detail-lines'), Array.isArray(s.lines) ? s.lines.join('\n') : '');
     setText($('lock'), s.state === 'locked' ? 'Unlock' : 'Lock');
     for (const id of ['attach', 'lock', 'resume', 'remove', 'send-row', 'rename-row']) show($(id), !tomb);
-    show($('restore'), tomb);
+    // Restore brings back the newest tombstone of the name, so only that row offers it.
+    const snap = ui.state && ui.state.snapshot;
+    show($('restore'), tomb && newestTombstones(snap && snap.sessions).has(s.name));
   }
 
   function render() {
@@ -470,6 +518,7 @@ function start() {
     const s = current();
     if (!s) return;
     actions.act(words.more(s.name), {
+      done: MORE_DONE,
       onSuccess(res) {
         if (ui.selected !== s.name) return;
         $('more-lines').textContent = res.stdout;
@@ -490,7 +539,7 @@ function start() {
     if (!s || to === '') return;
     actions.act(words.rename(s.name, to), {
       onSuccess() {
-        $('rename-to').value = '';
+        if (fieldsUnchanged({ to }, { to: $('rename-to').value })) $('rename-to').value = '';
         ui.selected = to;
       },
     });
@@ -513,17 +562,22 @@ function start() {
     e.preventDefault();
     const name = $('new-name').value.trim();
     if (name === '') return;
-    const w = words.create(name, $('new-repo').value.trim(), $('new-cmd').value.trim(), $('new-shell').checked);
+    const sent = { name, repo: $('new-repo').value.trim(), cmd: $('new-cmd').value.trim(), shell: $('new-shell').checked };
+    const w = words.create(sent.name, sent.repo, sent.cmd, sent.shell);
     actions.act(w, {
       onSuccess() {
-        for (const id of ['new-name', 'new-repo', 'new-cmd']) $(id).value = '';
-        $('new-shell').checked = false;
+        const now = { name: $('new-name').value, repo: $('new-repo').value, cmd: $('new-cmd').value, shell: $('new-shell').checked };
+        if (fieldsUnchanged(sent, now)) {
+          for (const id of ['new-name', 'new-repo', 'new-cmd']) $(id).value = '';
+          $('new-shell').checked = false;
+        }
         ui.selected = name;
       },
     });
   });
   $('log-button').addEventListener('click', () => {
     actions.act(words.log(), {
+      done: LOG_DONE,
       onSuccess(res) {
         const items = logEntries(res.stdout).map((entry) => {
           const li = document.createElement('li');

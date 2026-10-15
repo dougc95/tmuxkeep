@@ -63,9 +63,24 @@ test('bad values name the key, as the deploy scripts do', () => {
   assert.equal(reason('LAUNCH_CMD=a\tb\n'), 'no error');
 });
 
-test('a path that cannot be read as a file is an error', () => {
+test('a path that cannot be read as a file is an error, and the errno stays in the cause', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tk-config-'));
   assert.throws(() => readConfig(dir), { message: `config ${dir}: cannot read` });
+  let expected;
+  try {
+    fs.readFileSync(dir, 'latin1');
+  } catch (err) {
+    expected = err.code;
+  }
+  assert.match(expected, /^E[A-Z]+$/);
+  let thrown;
+  try {
+    readConfig(dir);
+  } catch (err) {
+    thrown = err;
+  }
+  assert.ok(thrown.cause instanceof Error);
+  assert.equal(thrown.cause.code, expected);
 });
 
 test('parseArgs: --port N and --no-open, each at most once, nothing else', () => {

@@ -15,10 +15,12 @@ const realClock = {
   clearTimeout: (t) => clearTimeout(t),
 };
 
-// endMessage(code, err, lastErr): the error shown after the child ended.
+// endMessage(code, err, lastErr): the error shown after the child ended. Exit 255 is ssh itself failing
+// (unreachable, but also a rejected host key or key): the last stderr line, when there is one, follows in
+// parentheses so the reason reaches the page.
 export function endMessage(code, err, lastErr) {
   if (err) return `cannot run ssh: ${err.code || err.message}`;
-  if (code === 255) return 'ssh exited 255: VPS unreachable';
+  if (code === 255) return lastErr ? `ssh exited 255: VPS unreachable (${lastErr})` : 'ssh exited 255: VPS unreachable';
   if (lastErr) return lastErr;
   return code === null ? 'ssh was stopped by a signal' : `ssh exited ${code}`;
 }

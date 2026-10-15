@@ -149,6 +149,18 @@ test('the last stderr line becomes the error: an old broker says unknown verb: s
   assert.equal(f.state().connected, false);
 });
 
+// Final review M1: BatchMode host-key and publickey failures also exit 255, so the message keeps the
+// last stderr line in parentheses when ssh printed one, and is the bare text when it printed nothing.
+test('exit 255 shows VPS unreachable with the last stderr line in parentheses when there is one', async () => {
+  const { children, f } = setup();
+  f.touch();
+  children[0].stderr.write('Warning: Permanently added x\ntmuxkeep@203.0.113.10: Permission denied (publickey).\n');
+  await flush();
+  children[0].emit('close', 255);
+  assert.equal(f.state().error, 'ssh exited 255: VPS unreachable (tmuxkeep@203.0.113.10: Permission denied (publickey).)');
+  assert.equal(f.state().connected, false);
+});
+
 // Review Focus 4: ssh that cannot be started must not crash the server; it shows and backs off.
 test('a child that fails to start reports cannot run ssh and is retried with backoff', async () => {
   const { clock, children, f } = setup();
@@ -183,7 +195,9 @@ test('endMessage covers a signal and a plain exit code', () => {
   assert.equal(endMessage(null, null, ''), 'ssh was stopped by a signal');
   assert.equal(endMessage(1, null, ''), 'ssh exited 1');
   assert.equal(endMessage(1, null, 'tmuxkeep: config invalid: x'), 'tmuxkeep: config invalid: x');
-  assert.equal(endMessage(255, null, 'ssh: connect to host x port 22: Connection refused'), 'ssh exited 255: VPS unreachable');
+  assert.equal(endMessage(255, null, ''), 'ssh exited 255: VPS unreachable');
+  assert.equal(endMessage(255, null, 'ssh: connect to host x port 22: Connection refused'),
+    'ssh exited 255: VPS unreachable (ssh: connect to host x port 22: Connection refused)');
 });
 
 test('with no touch for 120 seconds the child is killed and nothing restarts; the next touch starts it at once', async () => {
