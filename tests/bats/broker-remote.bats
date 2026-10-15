@@ -32,6 +32,17 @@ teardown() { teardown_remote; }
   [ "$(wc -l < /var/log/tmuxkeep/audit.log)" -eq 1 ]
 }
 
+@test "remote: TMUXKEEP_GATE_WAIT is ignored, the gate lock wait keeps its default bound" {
+  flock /home/claude/.tmuxkeep/gate.lock sleep 20 3>&- &
+  local holder=$!
+  _poll 5 bash -c "! flock -n /home/claude/.tmuxkeep/gate.lock true"
+  # With the override honoured the call would be refused (3) after 1 s; ignored, it is still waiting at 5 s.
+  run env SSH_ORIGINAL_COMMAND='unlock api' SSH_CLIENT='203.0.113.9 50000 22' TMUXKEEP_GATE_WAIT=1 \
+    timeout 5 bash "$TMUXKEEP_BIN" --key laptop </dev/null
+  { pkill -P "$holder" || :; kill "$holder" || :; } 2>/dev/null
+  [ "$status" -eq 124 ]
+}
+
 @test "remote: reap is refused (2) and audited" {
   run --separate-stderr remote 203.0.113.9 laptop reap
   [ "$status" -eq 2 ]
@@ -126,4 +137,33 @@ teardown() { teardown_remote; }
   run --separate-stderr remote 203.0.113.9 laptop "$(b64cmd send api abcd)"
   [ "$status" -eq 2 ]
   [ "$stderr" = "tmuxkeep: text longer than 3 bytes" ]
+}
+
+@test "remote: status is not gated, leaves one audit line per call, and reports the lease of this key id and client IP" {
+  rtm new-session -d -s api
+  printf '%s\n' "$(date +%s)" > /home/claude/.tmuxkeep/leases/laptop@203.0.113.9
+  run remote 203.0.113.9 laptop status
+  [ "$status" -eq 0 ]
+  jq -e '.lease_secs_left > 1790 and .lease_secs_left <= 1800 and ([.sessions[].name] == ["api"]) and .user == "claude"' <<<"$output"
+  [ "$(wc -l < /var/log/tmuxkeep/audit.log)" -eq 1 ]
+  [ "$(jq -r '[.verb, .ok, .detail, .ip, .key] | join(" ")' <<<"$(remote_audit_last)")" = 'status true lines=12 203.0.113.9 laptop' ]
+  run remote 198.51.100.7 laptop "$(b64cmd status --lines 0)"
+  [ "$status" -eq 0 ]
+  jq -e '.lease_secs_left == 0 and .lines == 0 and .sessions[0].lines == []' <<<"$output"
+  [ "$(wc -l < /var/log/tmuxkeep/audit.log)" -eq 2 ]
+  [ "$(jq -r '[.verb, .ok, .detail, .ip, .key] | join(" ")' <<<"$(remote_audit_last)")" = 'status true lines=0 198.51.100.7 laptop' ]
+}
+
+@test "remote: auth --end removes only the lease of this key id and client IP" {
+  local now
+  now=$(date +%s)
+  printf '%s\n' "$now" > /home/claude/.tmuxkeep/leases/laptop@203.0.113.9
+  printf '%s\n' "$now" > /home/claude/.tmuxkeep/leases/laptop@198.51.100.7
+  run remote 203.0.113.9 laptop "$(b64cmd auth --end)"
+  [ "$status" -eq 0 ]
+  [ "$output" = 'lease ended' ]
+  [ ! -e /home/claude/.tmuxkeep/leases/laptop@203.0.113.9 ]
+  [ -e /home/claude/.tmuxkeep/leases/laptop@198.51.100.7 ]
+  [ "$(jq -r .detail <<<"$(remote_audit_last)")" = lease-ended ]
+  [ "$(jq -r .ip <<<"$(remote_audit_last)")" = 203.0.113.9 ]
 }

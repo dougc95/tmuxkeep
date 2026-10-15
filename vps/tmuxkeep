@@ -12,6 +12,8 @@ OTP_HARD_MAX=10
 OTP_READ_TIMEOUT=60
 SEND_ENTER_DELAY=0.3
 SEND_MAX_BYTES=8000
+# Seconds a caller without a terminal waits for the gate lock before giving up (exit 3). Local mode: TMUXKEEP_GATE_WAIT.
+GATE_WAIT=20
 GATED_VERBS="new go send rename unlock rm resume auth"
 # shellcheck disable=SC2034  # rewritten by deploy.ps1 or deploy.sh, read by tmuxkeep-setup
 TMUXKEEP_VERSION=dev
@@ -26,6 +28,11 @@ TOMB_RE='^zz~([a-z][a-z0-9_-]{0,31})~([0-9]+)$'
 REAP_RE='^zz~[a-z][a-z0-9_-]*~([0-9]+)$'
 KEY_RE='^[a-z][a-z0-9_-]{0,15}$'
 URL_RE='^https://[!-~]+$'
+# The fields ls and status read per session. ":" separates them, not tab (tab is IFS whitespace and
+# would collapse an empty @tmuxkeep_locked field) and not "|" (a legal character in a session name).
+# tmux rewrites ":" in session names to "_", so no earlier field can contain it. The title is last,
+# so a ":" inside a title stays in the title.
+SESSION_ROW_FORMAT='#{session_name}:#{session_created}:#{session_activity}:#{session_attached}:#{@tmuxkeep_locked}:#{pane_title}'
 
 # ---- configuration (spec 4.1, 4.4, 4.5) ----
 # The root-owned /etc/tmuxkeep/tmuxkeep.conf, read with the parser below, never sourced. In
@@ -253,15 +260,55 @@ decode_args() { # decode_args WORD...: sets ARGS. "b64" first means every later 
 # If it ever returns non-zero instead, authorize fails closed (exit 4).
 authorize() { [[ " $GATED_VERBS " == *" $VERB "* ]] || return 0; gate || fail 4 "not authorized"; }
 
-# lease_valid FILE: status 0 when FILE holds a digits-only epoch E with 0 <= NOW - E < LEASE_SECS.
-# Anything else (missing, empty, signs, spaces, more than 15 digits, a future epoch) is no lease.
-lease_valid() {
+# lease_left FILE: status 0 when FILE holds a digits-only epoch E with 0 <= NOW - E < LEASE_SECS, and
+# LEASE_LEFT is then LEASE_SECS - (NOW - E). Anything else (missing, empty, signs, spaces, more than
+# 15 digits, a future epoch) is no lease: status 1 and LEASE_LEFT=0. Used by gate and status.
+lease_left() {
   local e='' age
+  LEASE_LEFT=0
   [[ -f $1 ]] || return 1
   { IFS= read -r e < "$1" || [[ -n $e ]]; } 2>/dev/null || return 1
   [[ $e =~ ^[0-9]{1,15}$ ]] || return 1
   age=$(( 10#$NOW - 10#$e ))
-  (( age >= 0 && age < LEASE_SECS ))
+  (( age >= 0 && age < LEASE_SECS )) || return 1
+  LEASE_LEFT=$(( LEASE_SECS - age ))
+}
+
+# otp_scan FILE NOW: sets OTP_COUNT to the entries of FILE inside OTP_FAIL_WINDOW (0 <= NOW - E <
+# OTP_FAIL_WINDOW) and OTP_NEWEST to the newest of them (0 when none). Lines that are not 1-15 digits
+# are ignored; a missing or unreadable file counts as empty (gate refuses an unreadable one first).
+otp_scan() {
+  local e age now=$(( 10#$2 ))
+  OTP_COUNT=0
+  OTP_NEWEST=0
+  [[ -f $1 && -r $1 ]] || return 0
+  while IFS= read -r e || [[ -n $e ]]; do
+    [[ $e =~ ^[0-9]{1,15}$ ]] || continue
+    e=$(( 10#$e ))
+    age=$(( now - e ))
+    if (( age < 0 || age >= OTP_FAIL_WINDOW )); then continue; fi
+    OTP_COUNT=$(( OTP_COUNT + 1 ))
+    if (( e > OTP_NEWEST )); then OTP_NEWEST=$e; fi
+  done < "$1"
+}
+
+# otp_cooldown_left NOW: sets COOLDOWN_LEFT from OTP_COUNT and OTP_NEWEST (run otp_scan first): the
+# seconds until the cooldown they imply ends, 0 when there is none.
+otp_cooldown_left() {
+  local now=$(( 10#$1 ))
+  COOLDOWN_LEFT=0
+  if (( OTP_COUNT >= OTP_FAIL_MAX && now - OTP_NEWEST < OTP_COOLDOWN )); then
+    COOLDOWN_LEFT=$(( OTP_COOLDOWN - (now - OTP_NEWEST) ))
+  fi
+}
+
+# fresh_now: a new reading of the clock into NOW, unless a local-mode test pinned it with TMUXKEEP_NOW.
+fresh_now() {
+  local fresh
+  if [[ ${MODE:-} != local ]] || ! [[ ${TMUXKEEP_NOW:-} =~ ^[0-9]+$ ]]; then
+    fresh=$(date +%s 2>/dev/null) || fresh=''
+    if [[ $fresh =~ ^[0-9]+$ ]]; then NOW=$fresh; fi
+  fi
 }
 
 # gate: the TOTP gate (spec 7.1). Returns 0 when the caller may proceed and exits through fail
@@ -274,20 +321,31 @@ lease_valid() {
 gate() {
   local now lease="$STATE_DIR/leases/$KEY_ID@$CLIENT_IP"
   local fails_file="$STATE_DIR/otp-fails" locked_file="$STATE_DIR/otp-locked"
-  local e='' code='' matched='' lastraw='' fresh='' made_lock=0 count=0 newest=0 last=0 n=0
-  local age secret step s out
+  local e='' code='' matched='' lastraw='' made_lock=0 last=0 n=0 gate_rc=0
+  local secret step s out
 
   # 1. State directory and the lock that serialises every gated call.
   mkdir -p "$STATE_DIR/leases" 2>/dev/null || fail 1 "cannot create state directory"
   { exec 9>>"$STATE_DIR/gate.lock"; } 2>/dev/null || fail 1 "cannot open the gate lock"
-  flock 9 || fail 1 "cannot take the gate lock"
-
-  # main sampled NOW before the lock wait, which can last a whole prompt. Take a fresh reading
-  # unless a local-mode test pinned the clock with TMUXKEEP_NOW.
-  if [[ ${MODE:-} != local ]] || ! [[ ${TMUXKEEP_NOW:-} =~ ^[0-9]+$ ]]; then
-    fresh=$(date +%s 2>/dev/null) || fresh=''
-    if [[ $fresh =~ ^[0-9]+$ ]]; then NOW=$fresh; fi
+  # A caller with a terminal waits as long as it takes (somebody else is typing a code and so may
+  # it). One without (the dashboard, scripts) waits GATE_WAIT seconds at most: it is told while it is
+  # still connected, so the refusal is printed and audited, instead of being cut off by its own
+  # timeout and left to finish unseen. 77 is flock's exit code for a lock still taken at the deadline.
+  if [[ -t 0 ]]; then
+    flock 9 || fail 1 "cannot take the gate lock"
+  else
+    flock -w "$GATE_WAIT" -E 77 9
+    gate_rc=$?
+    if (( gate_rc == 77 )); then
+      exec 9>&-
+      fail 3 "the gate is busy (a TOTP code is being typed); try again" gate-busy
+    elif (( gate_rc != 0 )); then
+      fail 1 "cannot take the gate lock"
+    fi
   fi
+
+  # main sampled NOW before the lock wait, which can last a whole prompt.
+  fresh_now
   now=$(( 10#$NOW ))
 
   # 2. Hard lockout: root must remove the marker. It overrides a valid lease.
@@ -296,27 +354,17 @@ gate() {
   fi
 
   # 3. A valid lease for this key id and client IP skips the prompt, except for auth itself.
-  if [[ $VERB != auth ]] && lease_valid "$lease"; then
+  if [[ $VERB != auth ]] && lease_left "$lease"; then
     exec 9>&-
     return 0
   fi
 
-  # 4. Cooldown: OTP_FAIL_MAX failures inside OTP_FAIL_WINDOW, the newest younger than OTP_COOLDOWN.
-  # newest is taken over the counted (in-window) entries. Lines that are not digits are ignored.
+  # 4. Cooldown: OTP_FAIL_MAX failures inside OTP_FAIL_WINDOW, the newest younger than OTP_COOLDOWN
+  # (otp_scan and otp_cooldown_left, shared with status).
   if [[ -e $fails_file && ! -r $fails_file ]]; then fail 1 "cannot read otp-fails"; fi
-  if [[ -f $fails_file ]]; then
-    while IFS= read -r e || [[ -n $e ]]; do
-      [[ $e =~ ^[0-9]{1,15}$ ]] || continue
-      e=$(( 10#$e ))
-      age=$(( now - e ))
-      if (( age < 0 || age >= OTP_FAIL_WINDOW )); then continue; fi
-      count=$(( count + 1 ))
-      if (( e > newest )); then newest=$e; fi
-    done < "$fails_file"
-  fi
-  if (( count >= OTP_FAIL_MAX && now - newest < OTP_COOLDOWN )); then
-    fail 4 "cooldown, retry in $(( OTP_COOLDOWN - (now - newest) ))s" cooldown
-  fi
+  otp_scan "$fails_file" "$now"
+  otp_cooldown_left "$now"
+  if (( COOLDOWN_LEFT > 0 )); then fail 4 "cooldown, retry in ${COOLDOWN_LEFT}s" cooldown; fi
 
   # 5. The prompt needs a terminal, and stdin being one is not enough: the prompt and the code
   # go through /dev/tty, so it must open. Neither case counts as a failed attempt.
@@ -465,10 +513,50 @@ session_locked() {
   [[ $v == "$1:1" ]]
 }
 
-# clean_title STRING: prints STRING with every non-printable character removed, which
-# includes C0, DEL and the UTF-8 C1 controls U+0080-U+009F. Needs a UTF-8 LC_ALL (main
-# exports C.UTF-8). Use it on any tmux-supplied text that is shown to a terminal.
-clean_title() { printf '%s' "${1//[^[:print:]]/}"; }
+# printable_only STRING: sets PRINTABLE to STRING with every non-printable character removed, which
+# includes C0, DEL and the UTF-8 C1 controls U+0080-U+009F. Needs a UTF-8 LC_ALL (main exports
+# C.UTF-8). clean_title prints the same; status uses this form to avoid a subshell per pane line.
+printable_only() { PRINTABLE=${1//[^[:print:]]/}; }
+
+# clean_title STRING: prints STRING through printable_only's filter. Use it on any tmux-supplied
+# text that is shown to a terminal.
+clean_title() { printable_only "$1"; printf '%s' "$PRINTABLE"; }
+
+# pane_tail N: stdin without its trailing blank lines, then the last N lines of what is left. The one
+# copy of the peek algorithm, used by peek and status.
+pane_tail() {
+  awk '{ l[NR] = $0 } /[^[:space:]]/ { last = NR } END { for (i = 1; i <= last; i++) print l[i] }' | tail -n "$1"
+}
+
+# parse_session_row ROW: splits one SESSION_ROW_FORMAT row into normalised fields, the one copy of that
+# normalisation (ls and status both use it). Sets ROW_NAME (as tmux printed it); ROW_STATE (live, locked
+# or tombstone); ROW_TOMB (the base name of a tombstone, else empty); ROW_ATTACHED (true or false);
+# ROW_AGE and ROW_IDLE (seconds since creation and since the last activity, never negative; a created
+# or activity field that is not 1-15 digits reads as NOW); ROW_TITLE (printable characters only, at
+# most 40). Runs in the calling shell and may not fail: no fail or succeed.
+parse_session_row() {
+  local created activity attached locked
+  IFS=':' read -r ROW_NAME created activity attached locked ROW_TITLE <<< "$1"
+  [[ $created =~ ^[0-9]{1,15}$ ]] || created=$NOW
+  [[ $activity =~ ^[0-9]{1,15}$ ]] || activity=$NOW
+  ROW_AGE=$(( 10#$NOW - 10#$created ))
+  ROW_IDLE=$(( 10#$NOW - 10#$activity ))
+  if (( ROW_AGE < 0 )); then ROW_AGE=0; fi
+  if (( ROW_IDLE < 0 )); then ROW_IDLE=0; fi
+  ROW_TOMB=
+  if [[ $ROW_NAME =~ $TOMB_RE ]]; then
+    ROW_STATE=tombstone
+    ROW_TOMB=${BASH_REMATCH[1]}
+  elif [[ $locked == 1 ]]; then
+    ROW_STATE=locked
+  else
+    ROW_STATE=live
+  fi
+  ROW_ATTACHED=false
+  if [[ $attached =~ ^[1-9][0-9]*$ ]]; then ROW_ATTACHED=true; fi
+  printable_only "$ROW_TITLE"
+  ROW_TITLE=${PRINTABLE:0:40}
+}
 
 humanise() { # humanise SECONDS: 59s, 59m, 23h, then days; floors; negative counts as 0
   local s=${1:-0}
@@ -524,13 +612,9 @@ verb_ls() { # ls [--names | --tombstones]
     exit 0
   fi
 
-  # ":" separates the fields, not tab (tab is IFS whitespace and would collapse an empty
-  # @tmuxkeep_locked field) and not "|" (a legal character in a session name). tmux rewrites
-  # ":" in session names to "_", so no earlier field can contain it. The title is last, so
-  # a ":" inside a title stays in the title.
   local -a rows=()
-  mapfile -t rows < <(tmx list-sessions -F '#{session_name}:#{session_created}:#{session_activity}:#{session_attached}:#{@tmuxkeep_locked}:#{pane_title}' 2>/dev/null)
-  local width=4 created activity attached locked title state mark shown
+  mapfile -t rows < <(tmx list-sessions -F "$SESSION_ROW_FORMAT" 2>/dev/null)
+  local width=4 mark shown
   for row in "${rows[@]}"; do
     IFS=':' read -r name _ <<< "$row"
     shown=$(clean_title "$name")
@@ -538,19 +622,12 @@ verb_ls() { # ls [--names | --tombstones]
   done
   printf '%-*s  %-9s  %-8s  %-5s  %-5s  %s\n' "$width" NAME STATE ATTACHED AGE IDLE TITLE
   for row in "${rows[@]}"; do
-    IFS=':' read -r name created activity attached locked title <<< "$row"
-    [[ $created =~ ^[0-9]+$ ]] || created=$NOW
-    [[ $activity =~ ^[0-9]+$ ]] || activity=$NOW
-    if [[ $name =~ $TOMB_RE ]]; then state=tombstone
-    elif [[ $locked == 1 ]]; then state=locked
-    else state=live
-    fi
+    parse_session_row "$row"
     mark=
-    if [[ $attached =~ ^[1-9][0-9]*$ ]]; then mark='*'; fi
-    shown=$(clean_title "$name")
-    title=$(clean_title "$title")
-    printf '%-*s  %-9s  %-8s  %-5s  %-5s  %s\n' "$width" "$shown" "$state" "$mark" \
-      "$(humanise $(( 10#$NOW - 10#$created )))" "$(humanise $(( 10#$NOW - 10#$activity )))" "${title:0:40}"
+    if [[ $ROW_ATTACHED == true ]]; then mark='*'; fi
+    shown=$(clean_title "$ROW_NAME")
+    printf '%-*s  %-9s  %-8s  %-5s  %-5s  %s\n' "$width" "$shown" "$ROW_STATE" "$mark" \
+      "$(humanise "$ROW_AGE")" "$(humanise "$ROW_IDLE")" "$ROW_TITLE"
   done
   succeed listed
 }
@@ -571,10 +648,94 @@ verb_peek() { # peek <name|tombstone> [-n N]
   if (( 10#$n == 0 )); then succeed "lines=$n"; fi
   local pane
   pane=$(tmux_on "$SESSION" capture-pane -p -J -S - 2>&1) || fail 1 "tmux: ${pane%%$'\n'*}"
-  printf '%s\n' "$pane" \
-    | awk '{ l[NR] = $0 } /[^[:space:]]/ { last = NR } END { for (i = 1; i <= last; i++) print l[i] }' \
-    | tail -n "$n" || fail 1 "cannot read pane"
+  printf '%s\n' "$pane" | pane_tail "$n" || fail 1 "cannot read pane"
   succeed "lines=$n"
+}
+
+# session_json ROW N: prints the status object of one session (spec 4.1) from a SESSION_ROW_FORMAT
+# row, on one line. The row fields come from parse_session_row. lines are the pane's last N lines by
+# pane_tail, each through printable_only and cut to 400 characters; a pane that cannot be read gives no
+# lines. dir_exists says whether WORK_DIR/<name> exists (for a tombstone, WORK_DIR/<base name>).
+session_json() {
+  local n=$2 base dir=false pane line
+  local -a lines=()
+  parse_session_row "$1"
+  base=${ROW_TOMB:-$ROW_NAME}
+  if [[ -d $WORK_DIR/$base ]]; then dir=true; fi
+  # Orchestrator ruling Q10: status captures at most 1000 history lines plus the visible pane, not
+  # the whole 50000-line scrollback, because it runs for every session every 2 seconds. pane_tail is
+  # unchanged; only a pane whose last 1000 lines of history and screen are all blank previews empty.
+  if (( n > 0 )) && pane=$(tmux_on "$ROW_NAME" capture-pane -p -J -S -1000 2>/dev/null); then
+    while IFS= read -r line; do
+      printable_only "$line"
+      lines+=("${PRINTABLE:0:400}")
+    done < <(printf '%s\n' "$pane" | pane_tail "$n")
+  fi
+  if (( ${#lines[@]} > 0 )); then printf '%s\n' "${lines[@]}"; fi |
+    jq -acnR --arg name "$ROW_NAME" --arg state "$ROW_STATE" --arg tomb "$ROW_TOMB" --argjson attached "$ROW_ATTACHED" \
+      --argjson age "$ROW_AGE" --argjson idle "$ROW_IDLE" --arg title "$ROW_TITLE" --argjson dir "$dir" \
+      '{name:$name,state:$state,tombstone_of:(if $tomb == "" then null else $tomb end),attached:$attached,age_secs:$age,idle_secs:$idle,title:$title,dir_exists:$dir,lines:[inputs]}'
+}
+
+# status_json N: prints one status snapshot (spec 4.1) on one line: version, now, user, lease and OTP
+# state for this key id and client IP, and every session in tmux order. It only reads: no gate lock,
+# and no tmux server is started. A tmux error or no server gives "sessions":[].
+status_json() {
+  local n=$1 now ts locked=false row
+  local -a rows=()
+  now=$(( 10#$NOW ))
+  ts=$(date -u -d "@$now" +%Y-%m-%dT%H:%M:%SZ) || return 1
+  lease_left "$STATE_DIR/leases/$KEY_ID@$CLIENT_IP" || LEASE_LEFT=0
+  otp_scan "$STATE_DIR/otp-fails" "$now"
+  otp_cooldown_left "$now"
+  if [[ -e $STATE_DIR/otp-locked || -L $STATE_DIR/otp-locked ]]; then locked=true; fi
+  mapfile -t rows < <(tmx list-sessions -F "$SESSION_ROW_FORMAT" 2>/dev/null)
+  for row in "${rows[@]}"; do session_json "$row" "$n"; done |
+    jq -acs --arg version "$TMUXKEEP_VERSION" --arg now "$ts" --arg user "$CF_USER" \
+      --argjson left "$LEASE_LEFT" --argjson lease "$LEASE_SECS" --argjson locked "$locked" \
+      --argjson fails "$OTP_COUNT" --argjson cool "$COOLDOWN_LEFT" --argjson lines "$n" \
+      '{version:$version,now:$now,user:$user,lease_secs_left:$left,lease_secs:$lease,otp:{locked:$locked,fails:$fails,cooldown_secs_left:$cool},lines:$lines,sessions:.}'
+}
+
+# status [--follow] [--lines N]: the dashboard's read (spec 4.1, D15, D19). Not gated. It returns the
+# tail of every pane, so it is audited like peek: one-shot writes one line (detail lines=N, N the
+# effective --lines) after the snapshot is printed; a usage error is audited too, as in every verb.
+# --follow writes one line (detail follow lines=N) when the connection starts, then turns auditing
+# off for the snapshots, one every 2 seconds each with a fresh NOW, until stdout is gone: a closed
+# pipe ends it by SIGPIPE, or by the failed write when SIGPIPE is ignored.
+verb_status() {
+  local usage="usage: tmuxkeep status [--follow] [--lines N]"
+  local follow=0 n=12 have_lines=0 json
+  while (( $# > 0 )); do
+    case $1 in
+      --follow)
+        (( follow == 0 )) || fail 2 "$usage"
+        follow=1
+        shift ;;
+      --lines)
+        (( have_lines == 0 && $# >= 2 )) || fail 2 "$usage"
+        n=$2
+        have_lines=1
+        shift 2 ;;
+      *) fail 2 "$usage" ;;
+    esac
+  done
+  if ! [[ $n =~ ^[0-9]{1,4}$ ]] || (( 10#$n > 40 )); then fail 2 "--lines must be 0-40"; fi
+  n=$(( 10#$n ))
+  authorize
+  if (( ! follow )); then
+    json=$(status_json "$n") || fail 1 "cannot build status"
+    printf '%s\n' "$json"
+    succeed "lines=$n"
+  fi
+  audit true "follow lines=$n"
+  AUDIT_ENABLED=0
+  while :; do
+    json=$(status_json "$n") || fail 1 "cannot build status"
+    printf '%s\n' "$json" 2>/dev/null || exit 0
+    sleep 2 || exit 1
+    fresh_now
+  done
 }
 
 verb_lock() { # lock <name>
@@ -588,8 +749,16 @@ verb_lock() { # lock <name>
   succeed locked
 }
 
-verb_auth() { # auth: always prompts for a code, then starts a lease for this key id and client IP
-  (( $# == 0 )) || fail 2 "usage: tmuxkeep auth"
+# auth: always prompts for a code, then starts a lease for this key id and client IP.
+# auth --end (spec 4.2, D18): removes that lease, with no gate and no code (ending a lease needs
+# none), so it is the one verb path that does not call authorize. Succeeds when there is no lease.
+verb_auth() {
+  if (( $# == 1 )) && [[ $1 == --end ]]; then
+    { rm -f -- "$STATE_DIR/leases/$KEY_ID@$CLIENT_IP"; } 2>/dev/null || fail 1 "cannot end lease"
+    printf 'lease ended\n'
+    succeed lease-ended
+  fi
+  (( $# == 0 )) || fail 2 "usage: tmuxkeep auth [--end]"
   authorize
   printf 'authenticated; lease valid for %s\n' "$(humanise "$LEASE_SECS")"
   succeed authenticated
@@ -974,6 +1143,7 @@ main() {
     if [[ -n ${TMUXKEEP_TMUX_SOCKET:-} ]]; then TMUX_SOCK=$TMUXKEEP_TMUX_SOCKET; fi
     if [[ -n ${TMUXKEEP_OATHTOOL:-} ]]; then OATHTOOL=$TMUXKEEP_OATHTOOL; fi
     if [[ ${TMUXKEEP_NOW:-} =~ ^[0-9]+$ ]]; then NOW=$TMUXKEEP_NOW; fi
+    if [[ ${TMUXKEEP_GATE_WAIT:-} =~ ^[1-9][0-9]{0,2}$ ]]; then GATE_WAIT=$TMUXKEEP_GATE_WAIT; fi
   fi
   if [[ -z $NOW ]]; then NOW=$(date +%s); fi
 
@@ -1005,7 +1175,7 @@ main() {
 
   VERB=${ARGS[0]:-}
   if [[ -z $VERB ]]; then
-    fail 2 "usage: tmuxkeep <new|ls|peek|go|send|rename|lock|unlock|rm|restore|resume|log|auth> [args]"
+    fail 2 "usage: tmuxkeep <new|ls|peek|go|send|rename|lock|unlock|rm|restore|resume|log|auth|status> [args]"
   fi
   if [[ $VERB == reap && $MODE == remote ]]; then fail 2 "reap is local only"; fi
   if ! [[ $VERB =~ ^[a-z]+$ ]] || ! declare -F "verb_$VERB" >/dev/null; then

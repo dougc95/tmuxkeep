@@ -202,3 +202,81 @@ answer() {
   if [ -z "${TK_EXPECT_BASH_MAJOR:-}" ]; then skip "TK_EXPECT_BASH_MAJOR not set"; fi
   [ "${BASH_VERSINFO[0]}" = "$TK_EXPECT_BASH_MAJOR" ] || { echo "bash $BASH_VERSION"; return 1; }
 }
+
+# fake_node: a stub node first on PATH; it logs its arguments like the other stubs and exits 7.
+fake_node() {
+  mkdir -p "$BATS_TEST_TMPDIR/nodebin"
+  printf '#!/usr/bin/env bash\n{ printf node; printf " [%%s]" "$@"; printf "\n"; } >> "$TK_STUB_LOG"\nexit 7\n' > "$BATS_TEST_TMPDIR/nodebin/node"
+  chmod +x "$BATS_TEST_TMPDIR/nodebin/node"
+  PATH="$BATS_TEST_TMPDIR/nodebin:$PATH"
+}
+
+# install_dashboard: the file deploy.sh would install, under the current HOME.
+install_dashboard() {
+  mkdir -p "$HOME/.local/share/tmuxkeep/dashboard"
+  : > "$HOME/.local/share/tmuxkeep/dashboard/server.js"
+}
+
+@test "ui runs node on the installed dashboard with the other words, returns its code and never calls ssh" {
+  # Review Focus 2: a home directory with a space in its path.
+  export HOME="$BATS_TEST_TMPDIR/home dir"
+  fake_node
+  install_dashboard
+  run tk_main ui --port 8080 --no-open
+  [ "$status" -eq 7 ]
+  [ "$(stub_calls)" = "node [$HOME/.local/share/tmuxkeep/dashboard/server.js] [--port] [8080] [--no-open]" ]
+}
+
+@test "run as a program, ui exits with node's code" {
+  fake_node
+  install_dashboard
+  run "$BASH" "$WRAPPER" ui
+  [ "$status" -eq 7 ]
+  [ "$(stub_calls)" = "node [$HOME/.local/share/tmuxkeep/dashboard/server.js]" ]
+}
+
+@test "ui without node on PATH says so, exits 2 and never calls ssh" {
+  local p="$STUBS:/usr/bin:/bin"
+  if ( PATH=$p; command -v node >/dev/null ); then skip 'a node is installed in /usr/bin or /bin'; fi
+  install_dashboard
+  PATH=$p
+  run --separate-stderr tk_main ui
+  [ "$status" -eq 2 ]
+  [ "$stderr" = 'tmuxkeep: node not found; install Node 20 or newer to use the dashboard' ]
+  [ ! -s "$TK_STUB_LOG" ]
+}
+
+@test "ui without an installed dashboard says where it looked and exits 2" {
+  fake_node
+  run --separate-stderr tk_main ui
+  [ "$status" -eq 2 ]
+  [ "$stderr" = "tmuxkeep: dashboard not installed at $HOME/.local/share/tmuxkeep/dashboard; run deploy again" ]
+  [ ! -s "$TK_STUB_LOG" ]
+}
+
+@test "ui is matched case-sensitively: UI goes to the broker like any other word" {
+  fake_node
+  install_dashboard
+  run tk_main UI
+  [ "$(stub_calls)" = "$(line_for 0 UI)" ]
+}
+
+# hex_word HEX: the bytes HEX spells, two hex digits per byte (printf %b with \0NNN works in bash 3.2).
+hex_word() {
+  local h=$1 esc=''
+  while [ -n "$h" ]; do
+    esc="$esc\0$(printf '%03o' "0x${h%"${h#??}"}")"
+    h=${h#??}
+  done
+  printf '%b' "$esc"
+}
+
+@test "every shared b64 case in tests/fixtures/b64-words encodes to its token" {
+  local label hex token n=0
+  while read -r label hex token; do
+    case $label in ''|'#'*) continue ;; esac
+    [ "$(tk_encode "$(hex_word "$hex")")" = "$token" ] || { echo "case $label"; return 1; }
+    n=$((n + 1))
+  done < "$REPO/tests/fixtures/b64-words"
+  [ "$n" -eq 15 ]
+}

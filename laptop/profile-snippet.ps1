@@ -54,7 +54,7 @@ Register-ArgumentCompleter -Native -CommandName tmuxkeep -ScriptBlock {
             ForEach-Object { $_.Extent.Text })
     $candidates = @()
     if ($done.Count -eq 1) {
-        $candidates = @('new', 'ls', 'peek', 'go', 'send', 'rename', 'lock', 'unlock', 'rm', 'restore', 'resume', 'log', 'auth')
+        $candidates = @('new', 'ls', 'peek', 'go', 'send', 'rename', 'lock', 'unlock', 'rm', 'restore', 'resume', 'log', 'auth', 'status', 'ui')
     }
     elseif ($done.Count -eq 2) {
         if ($done[1] -cin @('peek', 'go', 'send', 'rename', 'lock', 'unlock', 'rm', 'resume')) {

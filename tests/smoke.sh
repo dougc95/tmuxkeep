@@ -7,16 +7,20 @@
 # tests/bats/smoke.bats drives it with a fake wrapper instead.
 #
 # It creates one throwaway session named smoke-<6 random characters>, walks it through the whole
-# lifecycle (13 steps) and removes it again. Exit 0 when every step passes, 1 at the first mismatch:
+# lifecycle (14 steps) and removes it again. Exit 0 when every step passes, 1 at the first mismatch:
 # the script stops there and prints how to clean up by hand. The same hint is printed if the run is
 # interrupted while a session may exist. Step 1 (auth) runs uncaptured so the "TOTP: " prompt
-# reaches the terminal; every other step is captured, and the gated verbs reuse the lease.
+# reaches the terminal; step 4 captures stdout only and lets stderr through to the terminal; every
+# other step is captured (stdout and stderr), and the gated verbs reuse the lease. Step 4 checks the
+# dashboard's status JSON with jq when jq is installed, else with a fixed-string match.
 
 TK_WRAPPER=$HOME/.local/bin/tmuxkeep
 TK_N=''
 TK_SESSION_MAY_EXIST=0
 TK_HINT_PRINTED=0
 TK_OUT=''
+# The JSON checker for step 4. TK_SMOKE_JQ names another program for the tests.
+TK_JQ=${TK_SMOKE_JQ:-jq}
 
 # tk_cleanup_hint: how to remove a leftover test session, at most once, only while one may exist.
 tk_cleanup_hint() {
@@ -50,6 +54,16 @@ tk_step() {
   tk_check "$step" "$code" "$expect" "$TK_OUT" "$pattern"
 }
 
+# tk_names_session TEXT: status 0 when TEXT is a status object whose sessions include one named
+# $TK_N. With jq the object must parse; without it, the name must appear as jq -c prints it.
+tk_names_session() {
+  if command -v "$TK_JQ" >/dev/null; then
+    printf '%s\n' "$1" | "$TK_JQ" -e --arg n "$TK_N" 'any(.sessions[]; .name == $n)' >/dev/null
+  else
+    printf '%s\n' "$1" | grep -qF "\"name\":\"$TK_N\""
+  fi
+}
+
 tk_smoke_main() {
   local v code missing='' usage='usage: bash tests/smoke.sh [--wrapper <path>]'
   while [ "$#" -gt 0 ]; do
@@ -72,25 +86,36 @@ tk_smoke_main() {
   echo 'Type the code from your phone at the TOTP prompt.'
   "$TK_WRAPPER" auth
   code=$?
-  tk_check '1/13 auth' "$code" 0 '' ''
+  tk_check '1/14 auth' "$code" 0 '' ''
 
   # A session may exist from here on, even if new itself fails halfway.
   TK_SESSION_MAY_EXIST=1
-  tk_step "2/13 new $TK_N" 0 "created $TK_N in " new "$TK_N"
-  tk_step '3/13 ls (live row)' 0 "^${TK_N}[[:space:]]+live" ls
-  tk_step "4/13 peek $TK_N" 0 '' peek "$TK_N"
-  tk_step "5/13 send $TK_N /help" 0 "sent [0-9]+ bytes to $TK_N" send "$TK_N" /help
-  tk_step "6/13 lock $TK_N" 0 "locked $TK_N" lock "$TK_N"
-  tk_step "7/13 rm $TK_N (locked, must be refused with exit 3)" 3 '' rm "$TK_N"
-  tk_step "8/13 unlock $TK_N" 0 '' unlock "$TK_N"
-  tk_step "9/13 rm $TK_N (tombstone)" 0 "tombstoned $TK_N;" rm "$TK_N"
-  tk_step '10/13 ls (tombstone row)' 0 "^zz~$TK_N~[0-9]+[[:space:]]+tombstone" ls
-  tk_step "11/13 restore $TK_N" 0 "restored $TK_N" restore "$TK_N"
-  tk_step "12/13 rm $TK_N --now --confirm $TK_N" 0 "killed $TK_N" rm "$TK_N" --now --confirm "$TK_N"
+  tk_step "2/14 new $TK_N" 0 "created $TK_N in " new "$TK_N"
+  tk_step '3/14 ls (live row)' 0 "^${TK_N}[[:space:]]+live" ls
+
+  # 4. The dashboard's status: one JSON object that names the session. PASS only after that check.
+  TK_OUT=$("$TK_WRAPPER" status)
+  code=$?
+  if [ "$code" = 0 ] && ! tk_names_session "$TK_OUT"; then
+    tk_stop '4/14 status (JSON naming the session)' "the status output does not name $TK_N" "$TK_OUT"
+  fi
+  tk_check '4/14 status (JSON naming the session)' "$code" 0 "$TK_OUT" ''
+
+  tk_step "5/14 peek $TK_N" 0 '' peek "$TK_N"
+  tk_step "6/14 send $TK_N /help" 0 "sent [0-9]+ bytes to $TK_N" send "$TK_N" /help
+  tk_step "7/14 lock $TK_N" 0 "locked $TK_N" lock "$TK_N"
+  tk_step "8/14 rm $TK_N (locked, must be refused with exit 3)" 3 '' rm "$TK_N"
+  tk_step "9/14 unlock $TK_N" 0 '' unlock "$TK_N"
+  tk_step "10/14 rm $TK_N (tombstone)" 0 "tombstoned $TK_N;" rm "$TK_N"
+  tk_step '11/14 ls (tombstone row)' 0 "^zz~$TK_N~[0-9]+[[:space:]]+tombstone" ls
+  tk_step "12/14 restore $TK_N" 0 "restored $TK_N" restore "$TK_N"
+  tk_step "13/14 rm $TK_N --now --confirm $TK_N" 0 "killed $TK_N" rm "$TK_N" --now --confirm "$TK_N"
   # The session is gone now; a later failure has nothing to clean up.
   TK_SESSION_MAY_EXIST=0
 
-  # 13. The audit log must show every verb used against this session. PASS only after that check.
+  # 14. The audit log must show every verb used against this session, and the status call of step 4
+  # (status is audited like peek, amended D19; its line has no session name, ok true and detail
+  # lines=12, the default). PASS only after that check.
   TK_OUT=$("$TK_WRAPPER" log -n 20 2>&1)
   code=$?
   if [ "$code" = 0 ]; then
@@ -98,10 +123,13 @@ tk_smoke_main() {
       printf '%s\n' "$TK_OUT" | grep -F "\"verb\":\"$v\"" | grep -qF "\"session\":\"$TK_N\"" || missing="$missing $v"
     done
     if [ -n "$missing" ]; then
-      tk_stop '13/13 log -n 20 (audit lines for this session)' "no audit line for session $TK_N and verb:$missing" "$TK_OUT"
+      tk_stop '14/14 log -n 20 (audit lines for this session)' "no audit line for session $TK_N and verb:$missing" "$TK_OUT"
+    fi
+    if ! printf '%s\n' "$TK_OUT" | grep -F '"verb":"status"' | grep -F '"session":""' | grep -F '"ok":true' | grep -qF '"detail":"lines=12"'; then
+      tk_stop '14/14 log -n 20 (audit lines for this session)' 'no audit line with verb status, no session, ok true and detail lines=12 (status is audited, one line per call)' "$TK_OUT"
     fi
   fi
-  tk_check '13/13 log -n 20 (audit lines for this session)' "$code" 0 "$TK_OUT" ''
+  tk_check '14/14 log -n 20 (audit lines for this session)' "$code" 0 "$TK_OUT" ''
   trap - INT TERM
   echo 'smoke: all steps passed'
   return 0

@@ -4,3 +4,4 @@ tests/** text eol=lf
 laptop/*.sh text eol=lf
 laptop/completion.bash text eol=lf
 .github/** text eol=lf
+dashboard/** text eol=lf

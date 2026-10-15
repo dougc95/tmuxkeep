@@ -7,7 +7,8 @@ Long-running command-line sessions on your own VPS, driven from your laptop thro
 tmuxkeep keeps your sessions in tmux on a VPS and gives the laptop a small `tmuxkeep` command over them.
 
 - **Sessions in tmux on your VPS.** Each session is a tmux session in its own work directory, so it survives dropped SSH connections, laptop sleep and closed terminals. A VPS reboot ends the tmux server, but the work directories survive and `tmuxkeep resume` recreates the session.
-- **One SSH round trip per command.** `tmuxkeep new`, `ls`, `peek`, `go`, `send`, `rename`, `lock`, `unlock`, `rm`, `restore`, `resume`, `log` and `auth` each make one `ssh` call. You never handle tmux by hand.
+- **One SSH round trip per command.** `tmuxkeep new`, `ls`, `peek`, `go`, `send`, `rename`, `lock`, `unlock`, `rm`, `restore`, `resume`, `log`, `auth` and `status` each make one `ssh` call. You never handle tmux by hand.
+- **A local dashboard.** `tmuxkeep ui` opens a page on the laptop with every session, a live preview of its last lines and buttons for the everyday verbs, over the same key and the same gate (see "Dashboard").
 - **Soft delete.** `tmuxkeep rm` renames the session to a tombstone and leaves it running; `tmuxkeep restore` brings it back.
 - **A TOTP gate.** Anything that changes a session needs a six-digit code from your authenticator app. A good code opens a lease, so the next few commands do not ask again.
 - **An append-only audit log.** Every call, accepted or refused, is appended to `/var/log/tmuxkeep/audit.log`, a file the session user can append to but cannot rewrite.
@@ -37,6 +38,7 @@ Everything in this section is done by the operator, in a real terminal, because 
 - Windows PowerShell 5.1 (`powershell.exe`). The scripts are not written for `pwsh`, and `deploy.ps1` refuses to run under it.
 - The Windows OpenSSH client (`ssh`, `scp`, `ssh-keygen`) on the PATH.
 - `git` on the PATH, and this repository as a git checkout. Deploy stamps the broker with the git short hash and refuses to run outside a checkout.
+- Optional: Node.js 20 or newer, only for `tmuxkeep ui` (the dashboard, see "Dashboard"). Everything else works without it.
 - An authenticator app on your phone.
 - A Debian or Ubuntu VPS with systemd, and root on it (the root password or your provider's console, once, for step 2).
 
@@ -116,8 +118,8 @@ It asks for the admin-key passphrase twice, once for `scp` and once for `ssh`. B
 
 1. Reads the config, creates the session key if it is missing, and writes the `# >>> tmuxkeep` block with the two `Host` entries into `C:\Users\you\.ssh\config` (replacing the block in place if it is already there).
 2. Stages the VPS files (LF line endings, the broker stamped with the git short hash, plus `-dirty` if the tree has changes), your session public key as `laptop.pub` and `deploy.conf` in `%TEMP%\tmuxkeep-stage-<timestamp>`, copies them to `/root/tmuxkeep-deploy-<timestamp>` on the VPS, and runs `tmuxkeep-setup` there. The VPS directory is removed after setup runs, even if setup fails, and the local staging folder is removed on every exit path.
-3. Copies `laptop\tmuxkeep.ps1` to `C:\Users\you\scripts\tmuxkeep.ps1` and writes `laptop\profile-snippet.ps1` (the `tmuxkeep` function and its tab completer) into your `$PROFILE` between `# >>> tmuxkeep` and `# <<< tmuxkeep` markers, replacing the block in place if it is already there. `$PROFILE` is the one of the console that ran deploy (`powershell.exe`); the ISE and editors use other profile files.
-4. Runs `ssh -o BatchMode=yes tmuxkeep ls` as proof of life and prints `deploy: proof of life exit N` (0 means the session key works), then `deploy: done. Open a new PowerShell window to load the tmuxkeep function.`
+3. Copies `laptop\tmuxkeep.ps1` to `C:\Users\you\scripts\tmuxkeep.ps1` and writes `laptop\profile-snippet.ps1` (the `tmuxkeep` function and its tab completer) into your `$PROFILE` between `# >>> tmuxkeep` and `# <<< tmuxkeep` markers, replacing the block in place if it is already there. `$PROFILE` is the one of the console that ran deploy (`powershell.exe`); the ISE and editors use other profile files. It also replaces `C:\Users\you\scripts\tmuxkeep-dashboard` with a copy of the repository's `dashboard\` folder (without `test\`): the local dashboard that `tmuxkeep ui` starts.
+4. Runs `ssh -o BatchMode=yes tmuxkeep ls` as proof of life and prints `deploy: proof of life exit N` (0 means the session key works), then `dashboard: installed at C:\Users\you\scripts\tmuxkeep-dashboard (run: tmuxkeep ui)` and `deploy: done. Open a new PowerShell window to load the tmuxkeep function.`
 
 Open a new PowerShell window afterwards so the profile loads the `tmuxkeep` function. Windows' default execution policy (`Restricted`) blocks profiles and scripts, so if the new window prints `running scripts is disabled on this system`, or `tmuxkeep` is not recognized, allow local scripts once and open a new window again:
 
@@ -188,6 +190,7 @@ The steps are the same as on Windows (see "Install on Windows" for what each one
 
 - bash 3.2 or later (macOS ships 3.2 as `/bin/bash`; the scripts are written for it) and the usual POSIX tools.
 - The OpenSSH client (`ssh`, `scp`, `ssh-keygen`) and `git`, and this repository as a git checkout.
+- Optional: Node.js 20 or newer, only for `tmuxkeep ui` (the dashboard, see "Dashboard"). Everything else works without it.
 - An authenticator app on your phone, and a Debian or Ubuntu VPS with systemd and root on it.
 - Not supported: fish and `pwsh`.
 
@@ -232,6 +235,7 @@ It asks for the admin-key passphrase twice (scp, ssh), prints the TOTP secret an
 
 - the wrapper as `~/.local/bin/tmuxkeep` (mode 0755),
 - the completion script as `~/.tmuxkeep/completion.bash`,
+- the dashboard as `~/.local/share/tmuxkeep/dashboard` (the repository's `dashboard/` without `test/`, replaced on every deploy; the last lines of deploy say `dashboard: installed at ... (run: tmuxkeep ui)`),
 - a marked block in `~/.zshrc` when `$SHELL` ends in `zsh`, otherwise in `~/.bashrc`, replaced in place when it is already there.
 
 The block, in full:
@@ -297,6 +301,8 @@ On Windows `~` is your home directory (`C:\Users\you\.tmuxkeep\config`); on macO
 | `OTP_HARD_MAX` | `10` | integer from `OTP_FAIL_MAX` to 100 | Wrong codes since the last good one that lock the gate until root (or `-UnlockOtp`) clears it |
 | `OTP_READ_TIMEOUT` | `60` | integer 10-600 | Seconds the VPS waits at the `TOTP: ` prompt |
 | `SEND_MAX_BYTES` | `8000` | integer 1-65536 | Largest text that `send` accepts, in bytes |
+| `DASHBOARD_PORT` | `7707` | integer 1024-65535 | Loopback port of `tmuxkeep ui`; `--port` overrides it for one run. Laptop only: deploy never sends it to the VPS |
+| `TERMINAL_CMD` | empty | at most 200 printable ASCII characters | Program that opens a terminal for **Attach** and **Authenticate** in the dashboard, split on single spaces with the wrapper command appended (for example `alacritty -e` or `wezterm start --`); empty picks the platform default (see "Dashboard"). A path with spaces is not supported. Laptop only |
 
 **File rules.** One `KEY=value` per line; lines are trimmed; blank lines and lines that start with `#` are ignored. The key is everything before the first `=`, the value everything after it. No quotes, no escapes, no variable expansion. Keys are uppercase; an unknown key is an error that names the line, so a typo cannot silently fall back to a default. A key given twice: the last one wins. Values must be printable ASCII (0x20-0x7E); any other byte, including non-ASCII text, is an error. LF line endings only (a CR is an error) and no byte-order mark. Integers are 1 to 7 digits and range-checked. A bad file stops deploy with `deploy: config <path>: <reason>` before anything is touched.
 
@@ -410,7 +416,9 @@ tmuxkeep restore api
 | `restore` | `<name>` | no | Renames the newest tombstone of `<name>` back | `tmuxkeep restore api` |
 | `resume` | `<name> [--cmd <text>] [--shell]` | yes | Types `RESUME_CMD` (default `claude --continue`) into an idle shell, or recreates a missing session from its work directory first. `--cmd` and `--shell` as for `new` | `tmuxkeep resume api` |
 | `log` | `[-n N]` | no | Last N audit lines (default 50, 0-9999) | `tmuxkeep log -n 20` |
-| `auth` | none | yes | Always asks for a code and starts a lease | `tmuxkeep auth` |
+| `status` | `[--follow] [--lines N]` | no | One line of JSON: the lease and OTP state for this key and address, and every session with its last N pane lines (default 12, 0-40). Audited like `peek`: one line per call (`lines=N`). With `--follow` it writes one audit line for the whole connection (`follow lines=N`), then a new line every 2 seconds until the connection closes. The dashboard uses it | `tmuxkeep status --lines 5` |
+| `auth` | `[--end]` | yes (`--end` asks no code) | Always asks for a code and starts a lease. `--end` ends the lease of this key and address at once, without a code | `tmuxkeep auth --end` |
+| `ui` | `[--port N] [--no-open]` | local | Starts the dashboard on this laptop (see "Dashboard"); never sent to the VPS | `tmuxkeep ui` |
 
 There is also a `reap` verb that only runs locally on the VPS (the hourly timer runs `tmuxkeep --key reaper reap`); over SSH it is refused with `reap is local only`. The gated verbs are the eight marked "yes"; both laptop wrappers and the broker each carry that list, and a test keeps them equal.
 
@@ -465,6 +473,43 @@ ssh tmuxkeep ls
 ssh -t tmuxkeep go api
 ```
 
+## Dashboard
+
+`tmuxkeep ui` starts a small web server on the laptop and opens a page that shows every session with a live preview of its last lines, and buttons for the everyday verbs. It adds one trust boundary, the browser, and otherwise keeps tmuxkeep's security model: the same session key, the same gate and the same audit log, and a TOTP code is only ever typed into a real terminal (see "The dashboard" under "Security model and residual risks").
+
+**Requirements.** Node.js 20 or newer on the laptop (`node --version`) and nothing else: the dashboard has no packages to install and no build step. A laptop without Node loses only `tmuxkeep ui`. The VPS needs the broker from the same checkout, so deploy once after `git pull`.
+
+**Install.** Deploy copies the repository's `dashboard/` folder, without its tests, next to the wrapper: `C:\Users\you\scripts\tmuxkeep-dashboard` on Windows, `~/.local/share/tmuxkeep/dashboard` on macOS and Linux. The folder is replaced on every deploy, and the last lines of deploy say where it is: `dashboard: installed at <dir> (run: tmuxkeep ui)`.
+
+**Start and stop.**
+
+```
+tmuxkeep ui
+tmuxkeep ui --port 8080 --no-open
+```
+
+It prints `tmuxkeep ui: http://127.0.0.1:7707/<token>/  (Ctrl-C stops)` and opens that address in your browser (`--no-open` skips that; open the printed address yourself). The server listens on `127.0.0.1` only and stays in the foreground; `Ctrl-C` stops it. `<token>` is 32 random hexadecimal characters, new on every start, so an address from an earlier run gets an empty `404` page. The port is `DASHBOARD_PORT` from `~/.tmuxkeep/config` (default `7707`); `--port N` overrides it for one run.
+
+**The page.**
+
+- The header shows the broker version; a dot for the connection to the VPS; the lease (`lease 23:10` counting down, `no lease`, `cooldown 4:59`, or `LOCKED`); and two buttons: **End lease** runs `tmuxkeep auth --end`, **Authenticate** opens a terminal that runs `tmuxkeep auth`.
+- The dot is green while the page has a live connection to the VPS and a snapshot arrived within the last 10 seconds. Otherwise it is grey, and hovering over it shows why: `connecting`, the error of the connection, `no update for N s` (the connection is up but the broker has sent nothing for 10 seconds or more, as with a hung broker behind a live ssh), or that the local server is not running. A red banner, `not connected to the VPS: <reason>`, appears when the dot has been grey for 10 seconds, and at once for `no update for N s`.
+- The sessions table: name, state, attached, age, idle time and title, as `tmuxkeep ls` shows them. Tombstones are in a collapsed group. Click a row to select it.
+- The selected session shows its last 12 lines, updated every 2 seconds, and the buttons **Attach** (opens a terminal that runs `tmuxkeep go <name>`), **Lock** or **Unlock**, **Resume**, **More lines** (`peek -n 200`), **Remove** (soft delete: a tombstone) and **Send** (the text box; `Ctrl-Enter` sends). **Rename** takes the new name. **Remove now** kills the session and needs its name typed first, as the wrapper's prompt does. A tombstone has **Restore**, **More lines** and **Remove now**.
+- **New session**: a name, an optional `https://` repository and an optional command, or **Shell only** (`new` with `--repo`, `--cmd`, `--shell`). A clone can take minutes, so the dashboard waits up to 300 seconds for `new` with a repository; every other action is stopped after 30 seconds.
+- **Show the last 100 audit lines** runs `log -n 100`; failures are marked.
+- An action that fails shows the broker's own message and exit code; an exit 255 shows the wrapper's `ssh to host 'tmuxkeep' failed` line followed, in parentheses, by the last line ssh printed (for example `Permission denied (publickey).`), because a rejected key or host key exits 255 too.
+
+**When a verb needs a code.** If an action needs the TOTP gate and there is no lease, the page keeps the action, opens a terminal that runs `tmuxkeep auth` and says `type the code in the terminal that opened`. Type the code there. As soon as the page sees the new lease it sends the action once more by itself. Any other action, or 3 minutes without a lease, drops the waiting action. If another action is still running at that moment, the page says `another action is still running; the action that needed a code will be sent again in a moment` and tries again on the next update, until the 3 minutes are over. The code is never typed into the page.
+
+**End lease.** A lease lets every gated verb through for `LEASE_SECS` (30 minutes by default) from your address, and the page can use it too. When you are done, press **End lease** (or run `tmuxkeep auth --end`): your lease ends at once, with no code, and the next gated action asks again. A shorter `LEASE_SECS` narrows the window further.
+
+**What it costs.** While a page is open the server keeps one ssh connection running `tmuxkeep status --follow`, which writes one audit line when it starts and then sends a new snapshot every 2 seconds; if the connection drops it reconnects after 2, 4, 8 and 16 seconds and then every 30 seconds. When no page has asked for an update for 2 minutes (the tab was closed) it closes that connection, and the next page load opens it again. Each button is one ssh call, exactly like the same command typed in a terminal, and is audited like it; one action runs at a time.
+
+**Terminals.** **Attach** and **Authenticate** open a terminal that runs the wrapper: on Windows a new Windows Terminal tab when `wt.exe` is installed, otherwise (or when `wt.exe` is found but fails to start) a new PowerShell console window, opened through `cmd.exe /d /v:off /c start`; on macOS a Terminal window; on Linux `x-terminal-emulator`, or `$TERMINAL` when that is not installed. On Windows `cmd.exe` and `powershell.exe` are started by their full paths under `%SystemRoot%\System32` and `wt.exe` by the path found on `PATH`, so a program of the same name in the current folder is never picked up. `cmd.exe` expands `%` even inside quotes, and Windows Terminal expands `%NAME%` in its tab command line too, so the console-window path refuses a home folder path that contains `"` or `%`, and the Windows Terminal path refuses one that contains `%`, with `tmuxkeep ui: the home folder path contains " or %; set TERMINAL_CMD to open terminals another way`. On Linux, `x-terminal-emulator -e` closes its window as soon as the wrapper exits, so a message such as `wrong code` disappears with it; to keep the window open, set a terminal that holds it, for example `TERMINAL_CMD=xterm -hold -e`. To use another program, or to get past that refusal, set `TERMINAL_CMD` in `~/.tmuxkeep/config`: it is split on single spaces and the wrapper command is appended, so `TERMINAL_CMD=alacritty -e` runs `alacritty -e ~/.local/bin/tmuxkeep go api`. On Windows, `TERMINAL_CMD=wt.exe -w 0 new-tab` opens each terminal as a new tab of the current Windows Terminal window: it runs `wt.exe -w 0 new-tab C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -NoExit -File C:\Users\you\scripts\tmuxkeep.ps1 go api`. Because it does not go through `cmd.exe`, a lone `%` in your home folder path is harmless there, but Windows Terminal expands `%NAME%` when `NAME` is a defined variable, so a home folder path that contains such a name would be changed (the default Windows Terminal path refuses any `%` for that reason). A program path with spaces is not supported there.
+
+**Limits.** One VPS per dashboard; no terminal inside the page; no HTTPS and no login on the page (it is reachable from this machine only; on a machine shared with other users, anyone logged in who learns the address can use it); no mobile layout; and the server is not a background service: it runs while `tmuxkeep ui` runs. Text with line breaks or tabs cannot be sent, because the broker refuses control characters: send one line at a time.
+
 ## Quoting rules
 
 Both wrappers send each word base64-encoded, so nothing after the laptop's own shell needs quoting. What matters is what your shell does to the words first.
@@ -504,9 +549,9 @@ The words you type go through the PowerShell parser before `tmuxkeep` sees them.
 
 ## TOTP, leases and lockout
 
-Anything that changes a session needs a TOTP code from the authenticator app (the code is always on the phone; nothing on the laptop can generate it). The gated verbs are `new go send rename unlock rm resume auth`. `ls`, `peek`, `log`, `lock` and `restore` never ask.
+Anything that changes a session needs a TOTP code from the authenticator app (the code is always on the phone; nothing on the laptop can generate it). The gated verbs are `new go send rename unlock rm resume auth`. `ls`, `peek`, `log`, `lock`, `restore` and `status` never ask, and neither does `auth --end`.
 
-- `tmuxkeep auth` always prompts for a code, even while a lease is running, then prints `authenticated; lease valid for 30m` (the length follows `LEASE_SECS`). Run it first thing in a terminal session; it makes the next gated commands prompt-free.
+- `tmuxkeep auth` always prompts for a code, even while a lease is running (`tmuxkeep auth --end` is the one exception: it ends the lease of this key and address at once and never prompts), then prints `authenticated; lease valid for 30m` (the length follows `LEASE_SECS`). Run it first thing in a terminal session; it makes the next gated commands prompt-free.
 - A successful code starts a lease of `LEASE_SECS` (default 1800 seconds, 30 minutes), kept per key id and client address. The lease is not extended by use. If your public address changes (VPN, hotspot), the next gated command prompts again.
 - Without a lease, a gated command prompts `TOTP: ` on the VPS side of the terminal, with echo off and a timeout of `OTP_READ_TIMEOUT` seconds (default 60). The code is read on the VPS terminal, so it never appears in a command line, a process list or the audit log. The code for the previous, current and next 30-second step is accepted, and each code works once: a code that has just been used (or any earlier one) is refused, so wait for the next code. Phone and VPS clocks must be accurate (setup refuses to run without NTP on the VPS).
 - `Ctrl+C` is ignored at the `TOTP:` prompt, on purpose: an abandoned prompt must still count. To give up, press Enter on an empty line (one failure) or wait for the timeout (also one failure).
@@ -573,8 +618,8 @@ The log is `/var/log/tmuxkeep/audit.log` on the VPS: one JSON object per line, A
 ```
 
 - `ts` is UTC. `key` is the key id (`laptop`), `reaper` for the timer, or `local` for local calls. `ip` is the client address, `-` for local calls. `ok` is false for every refused or failed call, including bad names, wrong codes, cooldowns and lockouts.
-- `detail` is a short fixed word or the error message: `created dir=<dir>` (plus ` repo=<url with credentials replaced by ***>`), `len:<bytes>` for `send` (the text itself is never logged), `tombstoned`, `killed <session>`, `restored from <tombstone>`, `to <new name>` (rename), `locked`, `unlocked`, `resumed`, `recreated`, `authenticated`, `attached`, `reaped`, `reap failed`, `listed`, `lines=<N>`, and for gate failures `otp-fail`, `cooldown`, `otp-locked`, `no-tty`. `go` logs `attached` just before it hands the terminal to tmux, so a failed attach is also logged as attached.
-- `ls --names` and `ls --tombstones` are not logged. The reaper logs only when it kills something.
+- `detail` is a short fixed word or the error message: `created dir=<dir>` (plus ` repo=<url with credentials replaced by ***>`), `len:<bytes>` for `send` (the text itself is never logged), `tombstoned`, `killed <session>`, `restored from <tombstone>`, `to <new name>` (rename), `locked`, `unlocked`, `resumed`, `recreated`, `authenticated`, `attached`, `reaped`, `reap failed`, `listed`, `lines=<N>` (`peek`, `log` and a one-shot `status`), `follow lines=<N>` (`status --follow`, one line for the whole connection), `lease-ended` (`auth --end`), and for gate failures `otp-fail`, `cooldown`, `otp-locked`, `no-tty`, `gate-busy`. `go` logs `attached` just before it hands the terminal to tmux, so a failed attach is also logged as attached.
+- `ls --names` and `ls --tombstones` are not logged (they print names only); `status` and `peek`, which return pane text, are. The reaper logs only when it kills something.
 - Read it from the laptop with `tmuxkeep log -n 50` (the default), or filter the failures:
 
   ```powershell
@@ -623,7 +668,8 @@ Residual risks, stated plainly:
 - **The lease is shared by everyone who uses the key from the same public address.** It is kept per key id and client address, not per person or terminal, so for `LEASE_SECS` after you authenticate anyone holding the session key who connects from the same public address (a shared NAT, a VPN exit, a public Wi-Fi) passes the gate without a code.
 - **A key thief gets about three guesses per ten minutes** with the defaults (the cooldown) until the hard lock after ten failures. The same lock is a nuisance lever: someone with the key can lock you out until you run `-UnlockOtp` or `--unlock-otp`.
 - **The audit log records broker calls only.** Anything running as `USER` can append forged lines with any key, ip or verb (the file is append-only, not append-restricted), and can drive tmux directly with no audit line at all. The log cannot be rewritten, but what is in it is not proof of what happened.
-- **The open verbs need no code, so the key alone is enough to read.** Without the phone, someone holding the session key can `tmuxkeep ls`, read the scrollback of every pane with `tmuxkeep peek <name> -n 9999` (that includes anything a program printed, such as file contents and tokens), read the audit log with `tmuxkeep log`, and `tmuxkeep lock` your sessions. Only changing things is gated.
+- **A call whose connection drops after it acted may leave no audit line.** The audit line is written when the verb finishes, so a call whose connection has gone by then can have acted without leaving one. This is as it always was; the 20-second gate bound (the `the gate is busy` row in Troubleshooting) keeps the dashboard clear of it for calls that would queue behind a TOTP prompt.
+- **The open verbs need no code, so the key alone is enough to read.** Without the phone, someone holding the session key can `tmuxkeep ls`, read the scrollback of every pane with `tmuxkeep peek <name> -n 9999` (that includes anything a program printed, such as file contents and tokens), read the last lines of every pane at once with `tmuxkeep status` (up to 40 lines each; `status --follow` repeats it every 2 seconds), read the audit log with `tmuxkeep log`, and `tmuxkeep lock` your sessions. Only changing things is gated. `peek` and `status` are audited (one line per call, one per `--follow` connection), so these reads leave a trace, though the log is only a hint (see the previous point).
 - **`.bashrc` is sourced before the forced command**, so anything that can write `<USER_HOME>/.bashrc` runs on every broker call. That again needs code running as `USER`.
 - **`--cmd` and `LAUNCH_CMD` type text into a pane.** `--cmd` is an audited, gated form of what `send` already allows, and adds no capability. Whoever can edit `~/.tmuxkeep/config` on the laptop decides what the next deploy installs, `LAUNCH_CMD` included. That is the laptop's own trust level, and the admin passphrase still gates every deploy.
 - **`git clone --repo` credentials leak locally.** A URL like `https://user:token@host/repo.git` is visible in the VPS process list during the clone and persists in the clone's `.git/config`. The audit log redacts the userinfo, but a raw `/` inside the userinfo defeats the redaction, so percent-encode any `/`, `@` or `:` in a token. Prefer URLs without credentials (public repositories, or a git credential helper configured for `USER`), and strip a stored one afterwards with `git remote set-url origin <url without credentials>`.
@@ -650,7 +696,7 @@ Residual risks, stated plainly:
    OpenSSH 9.8 and newer name these processes `sshd-session` instead of `sshd`, which is why the pattern accepts both.
 
    Do not use `loginctl terminate-user <USER>` for this: it would also kill the tmux server and with it every session.
-3. Look at `/var/log/tmuxkeep/audit.log` for the calls the key made. It is only a hint (see "The audit log records broker calls only" above): it cannot show tmux activity or forged lines.
+3. Look at `/var/log/tmuxkeep/audit.log` for the calls the key made. Reads of the panes appear as `verb: peek` (`lines=N`) and `verb: status` (`lines=N` for a one-shot call, `follow lines=N` for a `--follow` connection). It is only a hint (see "The audit log records broker calls only" above): it cannot show tmux activity or forged lines.
 4. If the stolen laptop also held the admin key (`ADMIN_KEY`), replace that too, because its passphrase is then the only thing between the thief and root. On a clean machine create a new admin key with a distinct comment, for example `ssh-keygen -t ed25519 -f ~/.ssh/id_tmuxkeep_admin_ed25519 -C tmuxkeep-admin-2`, and install it as in step 2 of the install (with root password login off, use the provider's console to append the new `.pub` line to `/root/.ssh/authorized_keys`). Then, over the new key, delete the old admin key's line. The distinct comment is what lets one `sed` pick out the old line only:
 
    ```
@@ -663,6 +709,16 @@ Residual risks, stated plainly:
 
 The admin key is separate and passphrase-protected, but a stolen laptop gives the thief unlimited offline guesses at that passphrase, so step 4 is not optional when the admin key was on it.
 
+### The dashboard
+
+- The dashboard adds one trust boundary, the browser, and otherwise keeps tmuxkeep's security model: the same key, the same gate and the same audit. It holds no key, no secret and no code, and only runs ssh calls that the wrapper could run, encoded exactly as the wrapper encodes them, so the gate, the lease, the audit line and the exit codes stay the broker's.
+- Against another web page in the same browser: the server listens on `127.0.0.1` only; every address needs the per-run token; the `Host` header must be `127.0.0.1:<port>` or `localhost:<port>` (a DNS-rebinding guard); every action is a `POST` of `application/json` whose `Origin` and `Sec-Fetch-Site`, when the browser sends them, must be this page's; no CORS header is ever sent; and a strict Content Security Policy allows only the page's own script and stylesheet. A request that fails these checks gets an empty `404` or `403`.
+- Against hostile session output: everything that comes from the VPS (names, titles, pane lines, log lines, error text) is shown as plain text, never as HTML, never in an attribute or a URL; the policy forbids inline script; the VPS strips non-printable characters and cuts each line to 400 characters before it leaves.
+- Worst case if the page is driven by an attacker: whatever the session key with a live lease allows, including `send` into a shell, which is command execution as `USER`. That is the same ceiling as a compromised laptop today, and it lasts until the lease ends. **End lease** closes it at once; a shorter `LEASE_SECS` narrows it.
+- What is audited: every one-shot `tmuxkeep status` call leaves one audit line (`verb: status`, `detail: lines=N`), as `peek` does, and every `status --follow` connection leaves one (`detail: follow lines=N`, for the whole connection, not one per snapshot), so a stolen key cannot read the panes through `status` without a trace. `auth --end` is audited too (`detail: lease-ended`). Only `ls --names` and `ls --tombstones`, which print names only, are not logged.
+- The token appears in your browser history and on the screen; it changes on every `tmuxkeep ui`. On Linux other users can read process command lines, so a browser started by the opener (`xdg-open`) may keep the address in its own command line for as long as it runs; on macOS this is normally limited to your own processes. On a machine shared with other users run `tmuxkeep ui --no-open` and open the printed address yourself.
+- The local server writes nothing to disk: no log, no cache, no state.
+
 ## Development and tests
 
 **Layout.**
@@ -670,9 +726,9 @@ The admin key is separate and passphrase-protected, but a stolen laptop gives th
 ```
 LICENSE
 README.md
-.gitattributes              LF line endings for vps/, tests/, laptop/*.sh, laptop/completion.bash, .github/
+.gitattributes              LF line endings for vps/, tests/, dashboard/, laptop/*.sh, laptop/completion.bash, .github/
 .gitignore                  .claude/, .superpowers/, docs/vps-facts.md
-.github/workflows/ci.yml    the three CI jobs
+.github/workflows/ci.yml    the four CI jobs
 docs/superpowers/           design specs and implementation plans
 laptop/tmuxkeep.ps1         PowerShell wrapper (installed as ~\scripts\tmuxkeep.ps1)
 laptop/profile-snippet.ps1  the tmuxkeep function and its tab completer (written into $PROFILE)
@@ -680,6 +736,10 @@ laptop/deploy.ps1           PowerShell deploy
 laptop/tmuxkeep.sh          bash wrapper (installed as ~/.local/bin/tmuxkeep)
 laptop/completion.bash      bash and zsh tab completion
 laptop/deploy.sh            bash deploy
+dashboard/server.js         tmuxkeep ui, the local dashboard server (installed next to the wrapper)
+dashboard/lib/              protocol, validation, config, ssh, follow, terminal and HTTP modules
+dashboard/public/           the page: index.html, app.js, style.css
+dashboard/test/             node:test suites and the stand-in ssh (stub-ssh.js); not installed
 vps/tmuxkeep                the broker (the forced command)
 vps/tmuxkeep-setup          the root installer
 vps/vps-facts.sh            read-only facts script
@@ -740,33 +800,43 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command {
 
 Success ends with `Tests Passed: N, Failed: 0`. The Pester suites fake `ssh`, `scp` and `ssh-keygen` with stand-ins first on the PATH; neither test suite ever contacts a VPS.
 
-**CI.** `.github/workflows/ci.yml` runs on every push and pull request, in three jobs, with a read-only token (`permissions: contents: read` at the top of the workflow):
+**Node (the dashboard).** The dashboard runs on Node 20 or newer; the test command below needs Node 21 or newer. No packages. From the repository root:
+
+```
+node --test "dashboard/test/*.test.js"
+```
+
+Keep the quotes: Node expands the pattern itself on every platform, which only Node 21 and newer do (Node 20 does not expand the pattern), and `node --test dashboard/test` does not work, because Node then looks for a file of that name. The suites run the real modules against `dashboard/test/stub-ssh.js`, a stand-in for ssh that `TMUXKEEP_SSH` points to and a JSON script named in `TMUXKEEP_STUB_SCRIPT` drives; `TMUXKEEP_TERMINAL_DRYRUN=1` makes every terminal and browser launch return its command instead of starting it. Nothing contacts a VPS, opens a window, or listens anywhere but `127.0.0.1`. Success ends with `fail 0`; on Windows two tests (the SIGTERM one and the SIGINT one) are reported as skipped.
+
+**CI.** `.github/workflows/ci.yml` runs on every push and pull request, in four jobs, with a read-only token (`permissions: contents: read` at the top of the workflow):
 
 | Job | Runner | What it proves |
 |---|---|---|
 | `bats` | `ubuntu-latest` | Builds the test image from `tests/docker/Dockerfile` and runs every bats suite through `bash tests/run-bats.sh` (shellcheck runs inside): the broker, the installer and its templates, the config parsers, the bash laptop side, the parity checks and the static lints, on Linux |
 | `pester` | `windows-latest` | Proves that `powershell.exe` is Windows PowerShell 5.1, installs Pester for the current user and runs `tests\pester` under `powershell.exe -NoProfile`: the PowerShell wrapper, completer and deploy on the real 5.1 |
 | `macos` | `macos-latest` | Installs bats-core and shellcheck with Homebrew, proves that `/bin/bash` is 3.2, runs the laptop bats suites (`laptop-wrapper`, `completion`, `laptop-config`, `laptop-blocks`, `laptop-deploy`, `parity`, `smoke`, `lint-laptop`) under it and shellchecks the laptop files: the bash side on bash 3.2 and BSD tools |
+| `dashboard` | `ubuntu-latest` and `windows-latest` | Installs Node 22 with `actions/setup-node` and runs `node --test "dashboard/test/*.test.js"`: the dashboard's modules, its HTTP checks and the page's helpers, on Linux and on Windows |
 
 **How to add a test.**
 
 - *Bats, broker and installer.* Start the file with `load helpers`. These suites run in the Docker image with the repo mounted read-only at `/src`; `setup_local` gives each test a private state directory, audit log, work directory, tmux socket, fixed clock and a stand-in `oathtool`, with a config copied from `tests/fixtures/tmuxkeep.conf`.
 - *Bats, laptop side.* Start the file with `load laptop-helpers`. These suites must also pass under macOS `/bin/bash` 3.2: call scripts with `"$BASH"`, never a bare `bash`; `laptop_setup` gives a private `HOME` and `TMPDIR` with stand-in `ssh`, `scp` and `ssh-keygen` first on the PATH; `mk_repo_copy` makes a throwaway one-commit git copy to run `deploy.sh` from. Add a new laptop suite to the `macos` job's command in `.github/workflows/ci.yml` too.
 - *Pester.* Wrap the file's tests in a top-level `Describe` (Pester 6 rejects a file-level `BeforeEach`), and never put angle brackets in a `Describe` or `It` name, because Pester reads them as a template (the deliberate `-ForEach` templates are the exception). A file that dot-sources `laptop\deploy.ps1` gets its functions only, but the script's parameters are set as variables, so do not name your own variables `$Config`, `$Init`, `$HardenRoot`, `$RotateTotp`, `$UnlockOtp`, `$HomeDir` or `$ProfilePath`.
-- *Fixtures.* `tests/fixtures/` holds the bytes both deploys and the installer must write for the default config and `HOST=203.0.113.10`: `laptop-config`, `ssh-block`, `deploy.conf` and `tmuxkeep.conf`. Change a writer and its fixture together.
+- *Node.* Name the file `dashboard/test/<name>.test.js` (only `*.test.js` files run; `helpers.js` and `stub-ssh.js` are not tests) and use `node:test` and `node:assert/strict` only. Listen on `127.0.0.1` only, script ssh with `stubPlan` from `helpers.js`, and set `TMUXKEEP_TERMINAL_DRYRUN=1` or pass a `spawnFn` wherever a terminal or a browser could open. Every file under `dashboard/` must stay ASCII with LF line endings (`static.test.js` checks).
+- *Fixtures.* `tests/fixtures/` holds the bytes both deploys and the installer must write for the default config and `HOST=203.0.113.10`: `laptop-config`, `ssh-block`, `deploy.conf` and `tmuxkeep.conf`. Change a writer and its fixture together. `b64-words` holds the encoding cases that the dashboard and both wrappers must agree on, bit for bit.
 
 **The bash 3.2 and PowerShell 5.1 rules, in short.**
 
 - The laptop bash files (`laptop/tmuxkeep.sh`, `laptop/deploy.sh`, `laptop/completion.bash`, the laptop helpers, stubs and `tests/smoke.sh`) must run on macOS `/bin/bash` 3.2 and BSD tools: no associative arrays, `mapfile`, `${v,,}`, `read -i` or `|&`; no `set -u`; no GNU-only tools or flags (`sed -i`, `grep -P`, `readlink -f`, `date -d`, `base64 -w`, `realpath`, `timeout`). Every laptop shell file passes `shellcheck --shell=bash -S warning` with no exclusions and no `shellcheck disable` directive. In `vps/` two inline directives exist and nothing else is excluded: SC2034 on the `TMUXKEEP_VERSION` line of `vps/tmuxkeep` (the value is rewritten by deploy and read by `tmuxkeep-setup`) and SC2016 in `ensure_path_snippet` of `vps/tmuxkeep-setup` (the PATH block is written literally and expands at login). `tests/bats/lint-laptop.bats` enforces the laptop rules statically.
 - Every `.ps1` file is ASCII only, because Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI. `laptop/tmuxkeep.ps1` has no `param` block and no `[CmdletBinding()]`. Product code never writes a file with `>`, `Out-File`, `Set-Content` or `Tee-Object` (use `[IO.File]` with UTF-8 without BOM), and never redirects a native command's stderr, with one exception: the tab completer in `laptop/profile-snippet.ps1` runs its `ssh` with a single `2>$null`, so a warning from ssh never lands in the prompt. The broker's `GATED_VERBS` line must equal both wrappers' lists (tests check).
 
-**Line endings (`.gitattributes`).** `vps/**`, `tests/**`, `laptop/*.sh`, `laptop/completion.bash` and `.github/**` are forced to `eol=lf`. A single CR in a bash script breaks it on the VPS (`$'\r': command not found`) and in the Docker test image, and a Windows git with `core.autocrlf=true` would otherwise check files out with CRLF into the tree Docker mounts. Deploy also normalizes every staged file to LF, and setup refuses staged files that contain a CR. To check a working tree from Git Bash (the `-U` is required, or Git for Windows' grep strips the CR and the check passes silently), this must print nothing:
+**Line endings (`.gitattributes`).** `vps/**`, `tests/**`, `dashboard/**`, `laptop/*.sh`, `laptop/completion.bash` and `.github/**` are forced to `eol=lf`. A single CR in a bash script breaks it on the VPS (`$'\r': command not found`) and in the Docker test image, and a Windows git with `core.autocrlf=true` would otherwise check files out with CRLF into the tree Docker mounts. Deploy also normalizes every staged file to LF, and setup refuses staged files that contain a CR. To check a working tree from Git Bash (the `-U` is required, or Git for Windows' grep strips the CR and the check passes silently), this must print nothing:
 
 ```
-grep -rlIU "$(printf '\r')" vps tests laptop/*.sh laptop/completion.bash
+grep -rlIU "$(printf '\r')" vps tests dashboard laptop/*.sh laptop/completion.bash
 ```
 
-**Smoke test (operator only).** `tests\smoke.ps1` (Windows) and `bash tests/smoke.sh` (macOS, Linux) drive the real wrapper against the real VPS through a 13-step lifecycle: `auth`, `new`, `ls`, `peek`, `send /help`, `lock`, a refused `rm`, `unlock`, `rm`, `ls` (tombstone), `restore`, `rm --now --confirm`, and a final `log -n 20` check that the audit lines are there. Run it yourself from a terminal; step 1 asks for a code. Neither suite above ever runs it against a real server.
+**Smoke test (operator only).** `tests\smoke.ps1` (Windows) and `bash tests/smoke.sh` (macOS, Linux) drive the real wrapper against the real VPS through a 14-step lifecycle: `auth`, `new`, `ls`, `status` (its JSON must name the session; `smoke.ps1` parses it, and `smoke.sh` checks it with `jq` when `jq` is installed, otherwise as text), `peek`, `send /help`, `lock`, a refused `rm`, `unlock`, `rm`, `ls` (tombstone), `restore`, `rm --now --confirm`, and a final `log -n 20` check that the audit lines are there, the `status` one included. Run it yourself from a terminal; step 1 asks for a code. Neither suite above ever runs it against a real server.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\smoke.ps1
@@ -805,15 +875,41 @@ Broker failures print `tmuxkeep: <message>` on stderr and exit with the code sho
 | Tab shows nothing, or a stale list | Completion caches names for 60 seconds (see "Everyday use") and a failed fetch (offline, VPS down) is cached as an empty list for the same 60 seconds, by design, so an offline Tab does not hang. Wait a minute, or delete the two cache files. |
 | The admin key is installed but `ssh -o PasswordAuthentication=no tmuxkeep-admin true` still fails | A key line piped in from Windows PowerShell 5.1 can carry a byte-order mark and a CR, and sshd then ignores the line. From a root shell on the VPS (a password login or the provider's console): `sed -i -e 's/^\xEF\xBB\xBF//' -e 's/\r$//' ~/.ssh/authorized_keys`, then `grep -c $'\r' ~/.ssh/authorized_keys` must print 0. |
 
+### Dashboard
+
+| Symptom | Meaning and fix |
+|---|---|
+| `tmuxkeep: node not found; install Node 20 or newer to use the dashboard` (exit 2) | `node` is not on your PATH. Install Node.js 20 or newer and open a new terminal. |
+| `tmuxkeep ui: Node 20 or newer is required (found vX)` (exit 2) | Your Node is too old. Upgrade it. |
+| `tmuxkeep: dashboard not installed at <dir>; run deploy again` (exit 2) | The dashboard folder is missing (a deploy from before the dashboard, or one that stopped early). Deploy again. |
+| `tmuxkeep ui: port 7707 is in use; set DASHBOARD_PORT or pass --port` (exit 1) | Another program, often another `tmuxkeep ui`, has the port. Stop it, run `tmuxkeep ui --port 7708`, or set `DASHBOARD_PORT`. |
+| `tmuxkeep ui: config <path>: DASHBOARD_PORT: must be an integer from 1024 to 65535` (or a `TERMINAL_CMD` reason; exit 2) | Fix that value in `~/.tmuxkeep/config`. |
+| `tmuxkeep ui: --port must be an integer from 1024 to 65535` (exit 2) | The `--port` value is not a whole number in that range (for example `--port 80` or `--port 99999`). Pass a valid one, or leave `--port` out to use `DASHBOARD_PORT` (default 7707). |
+| `tmuxkeep ui: could not open a browser (<reason>); open the address above yourself` (a warning on stderr; the server keeps running) | The automatic opening failed: the program that opens addresses (`cmd.exe` on Windows, `open` on macOS, `xdg-open` on Linux) is missing or could not start, and `<reason>` is its error, for example `ENOENT`. Copy the address printed above into a browser yourself, or start with `--no-open` to skip the attempt. |
+| The page is blank or says `404` | The address is from an earlier run (the token changes every time) or was mistyped. Use the address `tmuxkeep ui` printed this time. |
+| The dot stays grey and the banner says `tmuxkeep: unknown verb: status` | The VPS still runs a broker from before the dashboard. Deploy again. |
+| The banner says `ssh exited 255: VPS unreachable`, usually followed by the last line ssh printed in parentheses (for example `ssh exited 255: VPS unreachable (Host key verification failed.)`), or shows another `ssh` or `tmuxkeep:` line | The follow connection failed for the reason shown. ssh exits 255 when the VPS is unreachable and also when it rejects the key or the host key, so read the part in parentheses. The server retries after 2, 4, 8 and 16 seconds, then every 30 seconds. Check `tmuxkeep ls` in a terminal (see the rows above). |
+| The dot turns grey and the banner says `no update for N s` | The connection to the VPS is open but the broker has sent no snapshot for 10 seconds or more, as when the broker hangs behind a live ssh. The dot turns green again if snapshots resume. If they do not, check `tmuxkeep ls` in a terminal, then stop `tmuxkeep ui` with `Ctrl-C` and start it again to open a fresh connection. A connection whose network path died is closed by ssh's keepalive after about two minutes, and the server then reconnects. |
+| The banner says `the local server is not running (tmuxkeep ui was stopped)` | The page cannot reach `tmuxkeep ui`: it was stopped (`Ctrl-C`, a closed terminal) or it crashed. Run `tmuxkeep ui` again and open the new address it prints; the token changed, so the old address no longer works. |
+| `cannot run ssh: ENOENT` in the banner, or `tmuxkeep ui: cannot run ssh: ...` after an action | The server could not start `ssh`: it is not on the PATH of the terminal that ran `tmuxkeep ui`, or (Windows) a `send` text is too long for one command line, which needs `SEND_MAX_BYTES` above about 24000. |
+| **Attach** or **Authenticate** says `no terminal program found; set TERMINAL_CMD in ~/.tmuxkeep/config` | Linux without `x-terminal-emulator` and without `$TERMINAL`. Set `TERMINAL_CMD`, for example `TERMINAL_CMD=gnome-terminal --`. |
+| `cannot start <program>: <reason>` after **Attach** or **Authenticate** (on Windows also `cannot start wt.exe: <reason>; cannot start cmd.exe: <reason>`) | The terminal program could not start. Check `TERMINAL_CMD`, or empty it to use the platform default. |
+| `tmuxkeep ui: the home folder path contains " or %; set TERMINAL_CMD to open terminals another way` after **Attach** or **Authenticate** (Windows) | Without Windows Terminal, or when it fails to start, the dashboard opens a PowerShell console window through `cmd.exe /d /v:off /c start`, and `cmd.exe` expands a `%` in your user folder path even inside quotes, so the dashboard refuses to build that command for a path with `"` or `%`. Windows Terminal expands `%NAME%` in its tab command line too, so the default Windows Terminal path refuses a `%` as well. Set `TERMINAL_CMD` in `~/.tmuxkeep/config` to open terminals another way, for example `TERMINAL_CMD=wt.exe -w 0 new-tab` (Windows Terminal; it does not go through `cmd.exe`, and a lone `%` is harmless there, but a path that contains `%NAME%` of a defined variable is expanded by Windows Terminal). When Windows Terminal failed to start first, the message follows `cannot start wt.exe: <reason>; `. |
+| `text contains control characters (line breaks and tabs cannot be sent; send one line at a time)` | The broker types text literally and refuses control characters. Send each line on its own. |
+| `another action is still running; try again in a moment` | One action runs at a time and the earlier one has not answered yet (after 30 seconds, or 300 seconds for `new` with `--repo`, it is stopped and reported as exit 124, though the VPS may still finish it). |
+| `exit 124: tmuxkeep ui: no answer within N seconds; ssh was stopped, but the VPS may still finish the action: check the page before you retry` (N is 30, or 300 for `new` with `--repo`) | The dashboard stopped waiting for ssh, but the action may still complete on the VPS. Do not retry at once: look at the page, or run `tmuxkeep log -n 20` in a terminal, to see whether it happened, and retry only if it did not. |
+| The page keeps saying `type the code in the terminal that opened` | The new lease has not shown up: the code was not accepted (on Linux a terminal that closes its window at once takes the `wrong code` message with it, see "Terminals"); the terminal's connection came from another address than the dashboard's (a VPN that covers one and not the other); or the dot is grey, so no snapshot arrives, the page cannot see the new lease and never sends the waiting action again (fix the connection first, see the rows above). After 3 minutes the waiting action is dropped; run it again. |
+
 ### Broker messages
 
 | Message | Exit | Meaning and fix |
 |---|---|---|
 | `TOTP required: run with a terminal or run 'tmuxkeep auth' first` | 4 | A code is needed but there is no terminal to ask on (a script, a pipe, a scheduled task). Run `tmuxkeep auth` in an interactive terminal; the lease then lets scripted gated calls through from the same address. Not counted as a failure. |
+| `the gate is busy (a TOTP code is being typed); try again` | 3 | Another call is at the `TOTP:` prompt on the VPS, and the gate lock is held for the whole prompt (up to `OTP_READ_TIMEOUT` seconds). A call without a terminal, such as the dashboard or a script, waits up to 20 seconds for it and is then refused, audited as `gate-busy`; a call with a terminal waits as long as it takes. Type the code in the terminal that is asking (or wait for its prompt to time out), then retry. Not counted as a failure. |
 | `wrong code` | 4 | Counted as a failure. Check the phone clock, type the current code, and remember a code works only once. |
 | `cooldown, retry in <n>s` | 4 | `OTP_FAIL_MAX` failures within `OTP_FAIL_WINDOW`. Wait the stated seconds (the cooldown ends `OTP_COOLDOWN` seconds after the newest failure), or run deploy with `-UnlockOtp` (`--unlock-otp`) to clear the failure list. |
 | `OTP locked after repeated failures; root must remove <USER_HOME>/.tmuxkeep/otp-locked` | 3 | `OTP_HARD_MAX` failures. Run deploy with `-UnlockOtp` (`--unlock-otp`), or as root `rm <USER_HOME>/.tmuxkeep/otp-locked` (the next wrong code locks again; see "TOTP, leases and lockout"). Check `tmuxkeep log` first. |
-| `audit log not writable` | 1 | The broker refuses to act without its audit trail. The file is missing, not append-writable by `USER`, or the disk is full. As root: `ls -l /var/log/tmuxkeep`, `lsattr /var/log/tmuxkeep/audit.log`, `df -h /var/log`. Re-run deploy to recreate a missing log, or `install -o <USER> -g <USER> -m 0640 /dev/null /var/log/tmuxkeep/audit.log` then `chattr +a` on it. `ls --names` and `ls --tombstones` still work (they are not audited). `tmuxkeep: audit write failed` means a write failed after the verb ran: check disk space. |
+| `audit log not writable` | 1 | The broker refuses to act without its audit trail. The file is missing or not append-writable by `USER`. As root: `ls -l /var/log/tmuxkeep`, `lsattr /var/log/tmuxkeep/audit.log`, `df -h /var/log`. Re-run deploy to recreate a missing log, or `install -o <USER> -g <USER> -m 0640 /dev/null /var/log/tmuxkeep/audit.log` then `chattr +a` on it. `ls --names` and `ls --tombstones` still work (they are not audited). The dashboard's follow connection fails with the same message and retries, because `status` is audited. `tmuxkeep: audit write failed` means a write failed after the verb ran: the disk is full or the file became unwritable, so check disk space. |
 | `tmuxkeep: config invalid: <path>: <reason>` | 1 | `/etc/tmuxkeep/tmuxkeep.conf` is missing, unreadable or invalid, so the broker refuses every call (and cannot audit it). Nothing is wrong with your session. Deploy again: it rewrites the file and checks it with `tmuxkeep --check-conf` first. Do not edit the file by hand. |
 | `TOTP not configured; run tmuxkeep-setup` | 1 | `totp.secret` is missing or empty. Run deploy: it creates a missing secret, and for an empty or damaged one setup says `totp.secret is malformed; re-run with --rotate-totp`, so use `-RotateTotp` (`--rotate-totp`). |
 | `go needs a terminal` | 4 | Run `tmuxkeep go` from a real terminal (Windows Terminal or a console window on Windows), not a pipe, a redirect or an embedded console. |
@@ -822,10 +918,10 @@ Broker failures print `tmuxkeep: <message>` on stderr and exit with the code sho
 | `pane busy (<command>)` | 3 | `resume` only types into an idle shell. Something is running in the pane (probably the program you started): `tmuxkeep go X`. |
 | `no such session: X`; `no tombstone for X`; `nothing to resume for X` | 5 | Check `tmuxkeep ls`. A tombstone shows as `zz~X~<epoch>`; `tmuxkeep restore X`. After a reboot `tmuxkeep resume X` recreates a session if `<WORK_DIR>/X` exists. |
 | `--shell and --cmd cannot be combined` | 2 | `--shell` means "type no command" and `--cmd` means "type this command"; use one of them. A `--cmd` of only spaces is the same as `--shell`. |
-| `invalid session name`, `missing session name`, `unknown verb`, `usage: ...`, `nothing to send`, `text contains control characters`, `text longer than N bytes` (N is `SEND_MAX_BYTES`), `-n must be 0-9999`, `--repo must be an https:// URL`, `--cmd must be at most 200 printable ASCII characters`, `--confirm must equal X`, `--confirm needs --now`, `reap is local only`, `bad encoded argument`, `control characters in command` | 2 | Argument errors; the message says what is wrong. Nothing ran and no code was asked for. |
+| `invalid session name`, `missing session name`, `unknown verb`, `usage: ...`, `nothing to send`, `text contains control characters`, `text longer than N bytes` (N is `SEND_MAX_BYTES`), `-n must be 0-9999`, `--lines must be 0-40`, `--repo must be an https:// URL`, `--cmd must be at most 200 printable ASCII characters`, `--confirm must equal X`, `--confirm needs --now`, `reap is local only`, `bad encoded argument`, `control characters in command` | 2 | Argument errors; the message says what is wrong. Nothing ran and no code was asked for. |
 | `git clone failed: <last line of git's error>` | 1 | Wrong URL, a private repository without credentials in the URL (git never prompts here), or no network. See the credential warning in the security section. |
 | `tmux: <message>`, `tmux: send-keys failed` | 1 | tmux refused. `tmuxkeep ls` to check the session still exists; a dead server means a reboot or crash took the sessions (`tmuxkeep resume`, `tmuxkeep new`). |
-| `cannot create state directory`, `cannot open the gate lock`, `cannot take the gate lock`, `cannot record failure`, `cannot record authentication`, `cannot read otp-fails`, `cannot create otp-locked` | 1 | `<USER_HOME>/.tmuxkeep` is not writable by `USER` (full disk, wrong owner). Re-run deploy, which repairs ownership. |
+| `cannot create state directory`, `cannot open the gate lock`, `cannot take the gate lock`, `cannot record failure`, `cannot record authentication`, `cannot read otp-fails`, `cannot create otp-locked`, `cannot end lease` | 1 | `<USER_HOME>/.tmuxkeep` is not writable by `USER` (full disk, wrong owner). Re-run deploy, which repairs ownership. |
 | `cannot create <WORK_DIR>` or `cannot create <WORK_DIR>/<name>` | 1 | `new` could not make the work directory: full disk, or a plain file or wrong owner at that path. Check `ls -ld <WORK_DIR>` over the admin path. |
 | `cannot read audit log`; `cannot read pane` | 1 | `log` could not read `/var/log/tmuxkeep/audit.log`, or `peek` could not read the pane. Check the file's permissions (`USER` must be able to read it), and that the session still exists. |
 | `not authorized`, `internal: verb returned` | 4, 1 | Fail-closed backstops that should never fire. Report them with the audit line. |

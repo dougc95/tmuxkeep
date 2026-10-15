@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tmuxkeep</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header>
+  <span class="brand">tmuxkeep</span>
+  <span id="version" class="muted"></span>
+  <span id="dot" class="dot off"><span id="dot-tip" class="tip"></span></span>
+  <span id="lease" class="lease">no data</span>
+  <span class="spacer"></span>
+  <button id="end-lease" type="button">End lease</button>
+  <button id="authenticate" type="button">Authenticate</button>
+</header>
+<div id="banner" class="banner" hidden></div>
+<div id="notice" class="notice" hidden></div>
+<main>
+  <section id="list">
+    <table id="sessions">
+      <thead>
+        <tr><th>Name</th><th>State</th><th>Attached</th><th>Age</th><th>Idle</th><th>Title</th></tr>
+      </thead>
+      <tbody id="session-rows"></tbody>
+    </table>
+    <p id="empty" class="muted" hidden>No sessions.</p>
+    <details id="tombstones">
+      <summary>Tombstones (<span id="tomb-count">0</span>)</summary>
+      <table><tbody id="tomb-rows"></tbody></table>
+    </details>
+    <form id="new-form">
+      <h2>New session</h2>
+      <label>Name <input id="new-name" autocomplete="off" spellcheck="false"></label>
+      <label>Repository URL (optional, https only) <input id="new-repo" autocomplete="off" spellcheck="false"></label>
+      <label>Command (optional) <input id="new-cmd" autocomplete="off" spellcheck="false"></label>
+      <label class="check"><input id="new-shell" type="checkbox"> Shell only</label>
+      <button type="submit">Create</button>
+    </form>
+  </section>
+  <section id="detail" hidden>
+    <h2 id="detail-name"></h2>
+    <pre id="detail-lines"></pre>
+    <div class="buttons">
+      <button id="attach" type="button">Attach</button>
+      <button id="lock" type="button">Lock</button>
+      <button id="resume" type="button">Resume</button>
+      <button id="more" type="button">More lines</button>
+      <button id="restore" type="button">Restore</button>
+      <button id="remove" type="button">Remove</button>
+    </div>
+    <pre id="more-lines" hidden></pre>
+    <div id="send-row">
+      <label for="send-text">Send (Ctrl-Enter sends)</label>
+      <textarea id="send-text" rows="3" spellcheck="false"></textarea>
+      <button id="send" type="button">Send</button>
+    </div>
+    <div id="rename-row" class="row">
+      <input id="rename-to" autocomplete="off" spellcheck="false" placeholder="new name">
+      <button id="rename" type="button">Rename</button>
+    </div>
+    <div class="row">
+      <input id="confirm-name" autocomplete="off" spellcheck="false" placeholder="type the session name">
+      <button id="remove-now" type="button">Remove now</button>
+    </div>
+  </section>
+</main>
+<section id="log">
+  <button id="log-button" type="button">Show the last 100 audit lines</button>
+  <ol id="log-lines"></ol>
+</section>
+</body>
+</html>

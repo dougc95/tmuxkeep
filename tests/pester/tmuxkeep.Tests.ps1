@@ -209,6 +209,81 @@ Describe 'tmuxkeep.ps1' {
         }
     }
 
+    Describe 'shared b64 cases' {
+        It 'encodes every case of tests\fixtures\b64-words to its token' {
+            . $Wrapper
+            $cases = @(Get-Content -LiteralPath (Join-Path $Repo 'tests\fixtures\b64-words') | Where-Object { $_ -and -not $_.StartsWith('#') })
+            $cases.Count | Should -Be 15
+            foreach ($case in $cases) {
+                $label, $hex, $token = $case -split ' '
+                $bytes = [byte[]]@(for ($i = 0; $i -lt $hex.Length; $i += 2) { [Convert]::ToByte($hex.Substring($i, 2), 16) })
+                ConvertTo-TmuxkeepToken ([Text.Encoding]::UTF8.GetString($bytes)) | Should -BeExactly $token -Because $label
+            }
+        }
+    }
+
+    Describe 'ui verb (local, spec 5.1)' {
+        BeforeAll {
+            # A home whose path has a space (Review Focus 2), with the wrapper installed the way deploy does it.
+            $script:UiHome = Join-Path $TestDrive 'home dir'
+            $script:UiScripts = Join-Path $UiHome 'scripts'
+            $script:UiWrapper = Join-Path $UiScripts 'tmuxkeep.ps1'
+            $script:UiServer = Join-Path $UiScripts 'tmuxkeep-dashboard\server.js'
+            New-Item -ItemType Directory -Path (Split-Path $UiServer) -Force | Out-Null
+            Copy-Item -LiteralPath $Wrapper -Destination $UiWrapper
+            Set-Content -LiteralPath $UiServer -Value '// stand-in' -Encoding ascii
+            $script:UiBin = Join-Path $TestDrive 'uibin'
+            New-Item -ItemType Directory -Path $UiBin | Out-Null
+            # A fake node: logs its arguments, exits 7.
+            Set-Content -LiteralPath (Join-Path $UiBin 'node.cmd') -Encoding ascii -Value @('@echo off', '>"%TK_NODE_LOG%" echo %*', 'exit /b 7')
+            $script:NodeLog = Join-Path $TestDrive 'node.log'
+        }
+
+        BeforeEach {
+            $script:SavedPath = $env:PATH
+            $env:TK_NODE_LOG = $NodeLog
+            Remove-Item -LiteralPath $NodeLog -ErrorAction SilentlyContinue
+        }
+
+        AfterEach {
+            $env:PATH = $SavedPath
+            Remove-Item Env:\TK_NODE_LOG -ErrorAction SilentlyContinue
+        }
+
+        It 'runs node on the installed server.js with the other words, exits with its code, and never calls ssh' {
+            $env:PATH = "$UiBin;$env:SystemRoot\System32"
+            & $UiWrapper ui --port 8080 --no-open
+            $LASTEXITCODE | Should -Be 7
+            (Get-Content -LiteralPath $NodeLog) | Should -BeExactly ('"' + $UiServer + '" --port 8080 --no-open')
+            Should -Invoke ssh -Times 0 -Exactly
+        }
+
+        It 'reports a missing node with exit 2 and never calls ssh' {
+            $env:PATH = "$env:SystemRoot\System32"
+            $out = & $UiWrapper ui 6>&1 | Out-String -Width 4096
+            $LASTEXITCODE | Should -Be 2
+            $out.Trim() | Should -BeExactly 'tmuxkeep: node not found; install Node 20 or newer to use the dashboard'
+            Test-Path -LiteralPath $NodeLog | Should -BeFalse
+            Should -Invoke ssh -Times 0 -Exactly
+        }
+
+        It 'reports a missing dashboard with exit 2' {
+            $env:PATH = "$UiBin;$env:SystemRoot\System32"
+            $bare = Join-Path $TestDrive 'bare\scripts'
+            New-Item -ItemType Directory -Path $bare -Force | Out-Null
+            Copy-Item -LiteralPath $Wrapper -Destination (Join-Path $bare 'tmuxkeep.ps1')
+            $out = & (Join-Path $bare 'tmuxkeep.ps1') ui 6>&1 | Out-String -Width 4096
+            $LASTEXITCODE | Should -Be 2
+            $out.Trim() | Should -BeExactly ('tmuxkeep: dashboard not installed at ' + (Join-Path $bare 'tmuxkeep-dashboard') + '; run deploy again')
+            Should -Invoke ssh -Times 0 -Exactly
+        }
+
+        It 'matches ui case-sensitively: UI goes to the broker like any other word' {
+            & $Wrapper UI
+            Actual | Should -BeExactly (Expected @('UI'))
+        }
+    }
+
     Describe 'contract with the broker' {
         It '$GatedVerbs equals the GATED_VERBS line in vps/tmuxkeep' {
             . $Wrapper

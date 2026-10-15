@@ -6,7 +6,7 @@ setup() {
   laptop_setup
   export TK_FAKE_DIR="$BATS_TEST_TMPDIR/fake"
   mkdir -p "$TK_FAKE_DIR"
-  unset TK_FAKE_IGNORE_LOCK TK_FAKE_RM_NOW_LOCKED
+  unset TK_FAKE_IGNORE_LOCK TK_FAKE_RM_NOW_LOCKED TK_FAKE_STATUS_EMPTY TK_FAKE_STATUS_BAD TK_FAKE_STATUS_STDERR TK_FAKE_STATUS_UNAUDITED TK_SMOKE_JQ
   SMOKE="$REPO/tests/smoke.sh"
   FAKE="$BATS_TEST_TMPDIR/fake-tmuxkeep"
   cat > "$FAKE" <<'EOF'
@@ -41,10 +41,28 @@ case $verb in
       echo tombstone > "$dir/state"
       echo "tombstoned $name; still running, reaped after 24h; restore with: tmuxkeep restore $name"; exit 0 ;;
   restore) echo live > "$dir/state"; echo "restored $name"; exit 0 ;;
+  status) if [ -n "${TK_FAKE_STATUS_STDERR:-}" ]; then echo 'warning: a stderr line that is not JSON' >&2; fi
+          if [ -n "${TK_FAKE_STATUS_BAD:-}" ]; then printf '{"sessions":[{"name":"%s"}\n' "$n"; exit 0; fi
+          if [ "$state" = live ] && [ -z "${TK_FAKE_STATUS_EMPTY:-}" ]; then
+            printf '{"version":"x","sessions":[{"name":"%s","state":"live"}]}\n' "$n"
+          else
+            printf '{"version":"x","sessions":[]}\n'
+          fi
+          exit 0 ;;
   log) while IFS= read -r c; do
          v=${c%% *}
          s=''
          case $c in *' '*) s=${c#* }; s=${s%% *} ;; esac
+         if [ "$v" = status ] && [ -n "${TK_FAKE_STATUS_UNAUDITED:-}" ]; then continue; fi
+         if [ "$v" = status ]; then
+           # What the broker writes for a one-shot status: ok true, detail lines=N (12 unless told otherwise).
+           ok=true
+           detail='lines=12'
+           if [ "${TK_FAKE_STATUS_AUDIT:-}" = failed ]; then ok=false; fi
+           if [ "${TK_FAKE_STATUS_AUDIT:-}" = other ]; then detail='lines=5'; fi
+           printf '{"verb":"status","session":"","ok":%s,"detail":"%s"}\n' "$ok" "$detail"
+           continue
+         fi
          printf '{"verb":"%s","session":"%s"}\n' "$v" "$s"
        done < "$dir/calls.log"
        exit 0 ;;
@@ -60,7 +78,7 @@ calls() { cat "$TK_FAKE_DIR/calls.log"; }
   run "$BASH" "$SMOKE" --wrapper "$FAKE"
   [ "$status" -eq 0 ] || { echo "$output"; return 1; }
   [[ "$output" == *'smoke: all steps passed'* ]]
-  [ "$(printf '%s\n' "$output" | grep -c '^PASS ')" -eq 13 ]
+  [ "$(printf '%s\n' "$output" | grep -c '^PASS ')" -eq 14 ]
 }
 
 @test "runs auth first and uses a fresh smoke- name of 6 characters" {
@@ -82,7 +100,7 @@ calls() { cat "$TK_FAKE_DIR/calls.log"; }
   export TK_FAKE_RM_NOW_LOCKED=1
   run "$BASH" "$SMOKE" --wrapper "$FAKE"
   [ "$status" -eq 1 ]
-  [[ "$output" == *'FAIL 12/13'* ]]
+  [[ "$output" == *'FAIL 13/14'* ]]
   printf '%s\n' "$output" | grep -Eq 'tmuxkeep rm smoke-[a-z0-9]{6} --now --confirm smoke-[a-z0-9]{6}'
   printf '%s\n' "$output" | grep -Eq "restore smoke-[a-z0-9]{6}'.*'tmuxkeep unlock smoke-"
   [ "$(printf '%s\n' "$output" | grep -c 'To clean it up')" -eq 1 ]
@@ -123,4 +141,74 @@ calls() { cat "$TK_FAKE_DIR/calls.log"; }
   done
   wait "$pid"
   grep -q 'smoke: all steps passed' "$out"
+}
+
+@test "step 4 fails, with the cleanup hint, when the status JSON does not name the session" {
+  export TK_FAKE_STATUS_EMPTY=1
+  run "$BASH" "$SMOKE" --wrapper "$FAKE"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'FAIL 4/14 status (JSON naming the session): the status output does not name smoke-'* ]]
+  [ "$(printf '%s\n' "$output" | grep -c 'To clean it up')" -eq 1 ]
+  [ "$(calls | tail -n 1)" = status ]
+  # The same failure without jq: the fixed-string fallback must reject a status that lacks the name.
+  export TK_FAKE_DIR="$BATS_TEST_TMPDIR/fake2"
+  mkdir -p "$TK_FAKE_DIR"
+  export TK_SMOKE_JQ=no-such-jq-program
+  run "$BASH" "$SMOKE" --wrapper "$FAKE"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'FAIL 4/14 status (JSON naming the session): the status output does not name smoke-'* ]]
+  [ "$(printf '%s\n' "$output" | grep -c 'To clean it up')" -eq 1 ]
+  [ "$(calls | tail -n 1)" = status ]
+}
+
+@test "step 4 reads stdout only: a stderr line on a successful status does not fail it" {
+  export TK_FAKE_STATUS_STDERR=1
+  run "$BASH" "$SMOKE" --wrapper "$FAKE"
+  [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+  [[ "$output" == *'PASS 4/14 status (JSON naming the session)'* ]]
+  [[ "$output" == *'smoke: all steps passed'* ]]
+}
+
+@test "step 14 fails when the audit log has no status line, as with a broker that does not audit status (amended D19)" {
+  export TK_FAKE_STATUS_UNAUDITED=1
+  run "$BASH" "$SMOKE" --wrapper "$FAKE"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'FAIL 14/14 log -n 20 (audit lines for this session): no audit line with verb status, no session, ok true and detail lines=12'* ]]
+  [[ "$output" != *'smoke: all steps passed'* ]]
+}
+
+# Final review L180: the status line must be a successful one with the default 12 lines, not just any line.
+@test "step 14 fails when the status audit line is a failure, or has another detail than lines=12" {
+  local mode
+  for mode in failed other; do
+    export TK_FAKE_STATUS_AUDIT=$mode
+    export TK_FAKE_DIR="$BATS_TEST_TMPDIR/fake-$mode"
+    mkdir -p "$TK_FAKE_DIR"
+    run "$BASH" "$SMOKE" --wrapper "$FAKE"
+    [ "$status" -eq 1 ] || { echo "$mode: $output"; return 1; }
+    [[ "$output" == *'FAIL 14/14 log -n 20 (audit lines for this session): no audit line with verb status, no session, ok true and detail lines=12'* ]]
+    [[ "$output" != *'smoke: all steps passed'* ]]
+  done
+}
+
+@test "step 14 passes on a status audit line with ok true and detail lines=12" {
+  run "$BASH" "$SMOKE" --wrapper "$FAKE"
+  [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+  [[ "$output" == *'PASS 14/14 log -n 20 (audit lines for this session)'* ]]
+  [[ "$output" == *'smoke: all steps passed'* ]]
+}
+
+@test "step 4 rejects output that is not JSON when jq is installed, and matches the name as text without jq" {
+  export TK_FAKE_STATUS_BAD=1
+  if command -v jq >/dev/null; then
+    run "$BASH" "$SMOKE" --wrapper "$FAKE"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *'FAIL 4/14'* ]]
+  fi
+  export TK_FAKE_DIR="$BATS_TEST_TMPDIR/fake2"
+  mkdir -p "$TK_FAKE_DIR"
+  export TK_SMOKE_JQ=no-such-jq-program
+  run "$BASH" "$SMOKE" --wrapper "$FAKE"
+  [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+  [[ "$output" == *'PASS 4/14 status (JSON naming the session)'* ]]
 }

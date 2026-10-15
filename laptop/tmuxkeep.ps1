@@ -3,7 +3,8 @@
 # Usage:  & "$HOME\scripts\tmuxkeep.ps1" <words...>      (the profile function passes @args)
 # Every word is base64-encoded (UTF-8) and sent as: ssh tmuxkeep b64 <token>...
 # The VPS side is a forced command, so quoting never reaches a remote shell.
-# Exit code: ssh's own, or 2 for a local usage error.
+# Exit code: ssh's own, or 2 for a local usage error. The one local verb, ui, is never sent: it runs
+# the dashboard server with node and returns node's exit code (2 when node or the dashboard is missing).
 #
 # Windows PowerShell 5.1 notes (each one was verified; keep this file as it is):
 #  - No param block and no CmdletBinding attribute at the top of this script.
@@ -85,6 +86,30 @@ foreach ($w in $words) {
         Write-Host 'tmuxkeep: empty argument'
         exit 2
     }
+}
+
+# "ui" is local (spec 5.1): it starts the dashboard server in the foreground and never reaches the
+# broker. Deploy installs the dashboard next to this script, in ~\scripts\tmuxkeep-dashboard.
+if ($words.Count -gt 0 -and $words[0] -ceq 'ui') {
+    $node = @(Get-Command -Name node -CommandType Application -ErrorAction SilentlyContinue)
+    if ($node.Count -eq 0) {
+        Write-Host 'tmuxkeep: node not found; install Node 20 or newer to use the dashboard'
+        exit 2
+    }
+    $dashboard = Join-Path $PSScriptRoot 'tmuxkeep-dashboard'
+    $server = Join-Path $dashboard 'server.js'
+    if (-not (Test-Path -LiteralPath $server -PathType Leaf)) {
+        Write-Host "tmuxkeep: dashboard not installed at $dashboard; run deploy again"
+        exit 2
+    }
+    [string[]]$uiArgs = @($server) + @($words | Select-Object -Skip 1)
+    $global:LASTEXITCODE = $null
+    & $node[0].Source @uiArgs
+    $code = $LASTEXITCODE
+    if ($null -eq $code) {
+        $code = 1
+    }
+    exit $code
 }
 
 # "send <name>" with no text: ask for it locally and send it as one word.

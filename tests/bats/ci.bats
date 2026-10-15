@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Static checks on .github/workflows/ci.yml (spec 9.6, 14). The workflow itself first runs on GitHub;
+# Static checks on .github/workflows/ci.yml (spec 9.6, 14; dashboard spec 9). The workflow itself first runs on GitHub;
 # these checks keep its required parts from drifting.
 load laptop-helpers
 
@@ -27,13 +27,16 @@ setup() { CI_FILE="$REPO/.github/workflows/ci.yml"; }
   [ "$p" -lt "$j" ]
 }
 
-@test "has the three jobs on the three runners" {
+@test "has the four jobs: bats, pester and macos on their runners, and dashboard on a two-runner matrix" {
   grep -qx '  bats:' "$CI_FILE"
   grep -qx '    runs-on: ubuntu-latest' "$CI_FILE"
   grep -qx '  pester:' "$CI_FILE"
   grep -qx '    runs-on: windows-latest' "$CI_FILE"
   grep -qx '  macos:' "$CI_FILE"
   grep -qx '    runs-on: macos-latest' "$CI_FILE"
+  grep -qx '  dashboard:' "$CI_FILE"
+  grep -qxF '        os: [ubuntu-latest, windows-latest]' "$CI_FILE"
+  grep -qxF '    runs-on: ${{ matrix.os }}' "$CI_FILE"
 }
 
 @test "the bats job runs every suite through tests/run-bats.sh" {
@@ -63,10 +66,19 @@ setup() { CI_FILE="$REPO/.github/workflows/ci.yml"; }
 }
 
 @test "every job has a 20 minute timeout, so a hang cannot run for the default six hours" {
-  [ "$(grep -c '^    timeout-minutes: 20$' "$CI_FILE")" -eq 3 ]
+  [ "$(grep -c '^    timeout-minutes: 20$' "$CI_FILE")" -eq 4 ]
   local r t
-  for r in ubuntu-latest windows-latest macos-latest; do
-    t=$(grep -n "^    runs-on: $r$" "$CI_FILE" | cut -d: -f1)
+  for r in ubuntu-latest windows-latest macos-latest '${{ matrix.os }}'; do
+    t=$(grep -nxF "    runs-on: $r" "$CI_FILE" | cut -d: -f1)
+    [ -n "$t" ] || { echo "no runs-on: $r"; return 1; }
     sed -n "$(( t + 1 ))p" "$CI_FILE" | grep -qx '    timeout-minutes: 20'
   done
+}
+
+@test "the dashboard job runs the Node suite on Node 22 with setup-node, with no npm install" {
+  grep -qx '      - uses: actions/setup-node@v4' "$CI_FILE"
+  grep -qx '          node-version: 22' "$CI_FILE"
+  grep -qxF '          node --test "dashboard/test/*.test.js"' "$CI_FILE"
+  grep -qx '      fail-fast: false' "$CI_FILE"
+  [ "$(grep -c 'npm' "$CI_FILE")" -eq 0 ]
 }
