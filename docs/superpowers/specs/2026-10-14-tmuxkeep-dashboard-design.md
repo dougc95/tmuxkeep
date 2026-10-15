@@ -81,7 +81,7 @@ fixtures, `tests/smoke.sh`/`tests/smoke.ps1` (one `status` call), `.github/workf
   `usage: tmuxkeep status [--follow] [--lines N]`.
 - One-shot: prints exactly one JSON object on one line, writes one audit line
   (`verb: status`, `ok: true`, `detail: lines=N`) and exits 0 (amended D19).
-- `--follow`: re-enables auditing for one write and writes one audit line first
+- `--follow`: writes one audit line first
   (`verb: status`, `ok: true`, `detail: follow lines=N`; a failed write prints the usual
   `audit write failed` warning and the stream still runs), then prints one JSON object
   per line every 2 seconds
@@ -126,6 +126,16 @@ fixtures, `tests/smoke.sh`/`tests/smoke.ps1` (one `status` call), `.github/workf
 `status` joins the usage line in `main`. It is not gated, so `GATED_VERBS` in the broker
 and both wrappers are unchanged and the parity test keeps passing untouched. Completion
 lists in `profile-snippet.ps1` and `completion.bash` gain `status` and `ui`.
+
+### 4.4 Gate lock wait for callers without a terminal (ruling 2026-10-14)
+
+The gate holds its lock for a whole TOTP prompt. A gated call whose stdin is not a
+terminal (the dashboard, scripts) waits at most 20 seconds for that lock and is then
+refused with exit 3, `the gate is busy (a TOTP code is being typed); try again`, printed
+and audited while the caller is still connected. Callers with a terminal wait as before.
+Why: the dashboard stops an action after 30 seconds; without the bound, a call queued
+behind an open prompt ran later, unseen, and died at its first output write before its
+audit line.
 
 ## 5. Laptop changes
 
@@ -211,7 +221,9 @@ frame-ancestors 'none'`. No CORS header is ever sent.
 as a child process, stdout parsed line by line as JSON; an unparsable line is dropped
 and counted. Each parsed object replaces the snapshot and sets `updated`. When the child
 exits: `connected=false`, `error` is the last stderr line (or
-`ssh exited 255: VPS unreachable` for 255), and it restarts after 2, 4, 8, 16, 30, 30...
+`ssh exited 255: VPS unreachable`, followed by ` (<last stderr line>)` when ssh printed
+one, for 255; ruling 2026-10-14, because host-key and publickey failures also exit 255),
+and it restarts after 2, 4, 8, 16, 30, 30...
 seconds, reset to 2 after a successful object. Idle stop: when no `/api/state` request
 has arrived for 120 seconds the child is killed and `connected=false`; the next request
 starts it again (so a closed tab does not keep an ssh session open all day).
@@ -227,7 +239,9 @@ where the broker accepts them: `peek`, `rm --now`), repo URL `https://` only, `-
 text at most 200 printable ASCII characters, `send` text at most 65,536 bytes with no
 control characters except tab, `-n` 0-9999, `--lines` 0-40. Then it runs
 `ssh -o BatchMode=yes -o ConnectTimeout=5 tmuxkeep b64 <tokens>` with no `-t`, stdin
-closed, a 30-second timeout (kill, `code: 124`), one action at a time (a second request
+closed, a 30-second timeout (300 seconds for `new` with `--repo`, for the clone; kill,
+`code: 124`, with a message saying the VPS may still finish the action, so check the page
+before retrying), one action at a time (a second request
 while one runs gets `409`). Response `{"code":<int>,"stdout":"...","stderr":"...",
 "needs_auth":<bool>}` where `needs_auth` is `code == 4` and stderr contains
 `TOTP required`. The encoding of words is bit-identical to the wrappers (standard
@@ -260,6 +274,12 @@ none) and `openBrowser` refuses any address other than
    validated, the path is quoted).
 4. Linux: `x-terminal-emulator -e <wrapper> <verb> [<name>]`, falling back to
    `$TERMINAL -e ...` when set.
+
+On Windows, `cmd.exe` and `powershell.exe` are started by absolute path under
+`%SystemRoot%\System32` (also inside the `start` line and the `wt.exe` command), `wt.exe`
+by the path found on PATH, and both `cmd.exe` argvs carry `/d /v:off` before `/c`
+(ruling 2026-10-14: no AutoRun, no delayed expansion, no program lookup in the current
+folder).
 
 Every spawn is an argv array with `shell: false`. `TMUXKEEP_TERMINAL_DRYRUN=1` makes
 `terminal.js` return the argv instead of spawning, for tests. Response
